@@ -52,6 +52,11 @@
   the count, move set bits toward the start of the range) instead of
   falling back to raw byte bisection. Values generated for a given seed
   change as a result.
+- `sample::Selector` is now a wrapper over `sample::Index` instead of
+  carrying its own RNG: selection is uniform, `try_select` buffers the
+  iterator's items, and shrinking moves the selection precisely toward
+  earlier elements under both engines instead of haphazardly. Values
+  selected for a given seed change as a result.
 
 ### Bug Fixes
 
