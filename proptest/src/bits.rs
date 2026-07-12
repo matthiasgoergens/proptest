@@ -297,6 +297,14 @@ impl<T: BitSetLike> Strategy for SampledBitSetStrategy<T> {
         // move set bits toward the start of the range.
         let mut free: Vec<usize> = self.bits.iter().collect();
         for _ in 0..count {
+            // The constructor asserts count <= available bits; keep the
+            // invariant checked where the arithmetic depends on it, so
+            // a future construction path failing it gets a clear
+            // message instead of a usize underflow.
+            assert!(
+                !free.is_empty(),
+                "SampledBitSetStrategy: count exceeds available bits"
+            );
             runner.start_span();
             let hi = free.len() - 1;
             let ix = runner

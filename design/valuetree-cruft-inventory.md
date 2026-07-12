@@ -135,10 +135,11 @@ serialized choice tape.
 - bits.rs draws raw RNG (bits.rs:206-214, 288-291): under the tape it
   regresses to untyped byte-bisection, losing its bit-aware shrink.
   sample::Subsequence inherits this. Migrate to typed draws.
-- sample::Selector (sample.rs:320-419): clones a whole TestRng into the
-  value, consumes it lazily at test time, outside any engine; docs admit
-  "haphazard" shrinking. Cannot be tape-migrated without API rethink;
-  candidate for deprecation in favor of Index-based selection.
+- sample::Selector: RESOLVED on this branch (commit 5228b14). It no
+  longer smuggles a TestRng; it is a wrapper over Index (buffer the
+  iterator, pick one stable position), shrinking precisely under both
+  engines. Kept here for the record because the surrounding analysis
+  referenced it.
 - hash_map/hash_set MinSize dedup: generate-vec-then-reject loop; the
   principled fix (Hypothesis-style) is dedup-aware generation: retry only
   the colliding element (a local redraw) instead of rejecting the whole
