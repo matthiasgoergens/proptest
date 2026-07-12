@@ -24,7 +24,6 @@ use core::mem;
 use bit_set::BitSet;
 #[cfg(feature = "bit-set")]
 use bit_vec::BitVec;
-use rand::{seq::IteratorRandom, RngExt};
 
 use crate::collection::SizeRange;
 use crate::num::sample_uniform_incl;
@@ -206,8 +205,11 @@ impl<T: BitSetLike> Strategy for BitSetStrategy<T> {
     fn new_tree(&self, runner: &mut TestRunner) -> NewTree<Self> {
         let mut inner = T::new_bitset(self.max);
         for bit in self.min..self.max {
+            // A typed choice per candidate bit, so the tape engine
+            // clears individual bits (Bool shrinks to false) instead of
+            // bisecting the raw draws underneath them.
             if self.mask.as_ref().map_or(true, |mask| mask.test(bit))
-                && runner.rng().random()
+                && runner.draw_bool(0.5)
             {
                 inner.set(bit);
             }
@@ -277,17 +279,30 @@ impl<T: BitSetLike> Strategy for SampledBitSetStrategy<T> {
 
     fn new_tree(&self, runner: &mut TestRunner) -> NewTree<Self> {
         let mut bits = T::new_bitset(self.bits.end_excl());
-        let count = sample_uniform_incl(
-            runner,
-            self.size.start(),
-            self.size.end_incl(),
-        );
+        let (min_count, max_count) = (self.size.start(), self.size.end_incl());
+        // A typed choice, so the tape engine lowers the count toward the
+        // minimum (and the lower-and-delete pass can drop one selection
+        // span along with it).
+        let count = runner.draw_integer_in(min_count, max_count, |r| {
+            sample_uniform_incl(r, min_count, max_count)
+        });
         if bits.len() < count {
             panic!("not enough bits to sample");
         }
 
-        for bit in self.bits.iter().sample(runner.rng(), count) {
-            bits.set(bit);
+        // Select `count` distinct bits by drawing indices into the
+        // shrinking list of free positions: uniform over k-subsets like
+        // rand's IteratorRandom::sample, but each selection is a typed
+        // choice in its own span with shrink target 0, so tape edits
+        // move set bits toward the start of the range.
+        let mut free: Vec<usize> = self.bits.iter().collect();
+        for _ in 0..count {
+            runner.start_span();
+            let hi = free.len() - 1;
+            let ix = runner
+                .draw_integer_in(0, hi, |r| sample_uniform_incl(r, 0, hi));
+            bits.set(free.remove(ix));
+            runner.end_span();
         }
 
         Ok(BitSetValueTree {
@@ -539,6 +554,51 @@ pub use self::varsize::VarBitSet;
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn tape_runner() -> crate::test_runner::TestRunner {
+        crate::test_runner::TestRunner::new_with_rng(
+            crate::test_runner::Config {
+                shrink_engine: crate::test_runner::ShrinkEngine::Tape,
+                failure_persistence: None,
+                ..crate::test_runner::Config::default()
+            },
+            crate::test_runner::TestRng::deterministic_rng(
+                crate::test_runner::RngAlgorithm::default(),
+            ),
+        )
+    }
+
+    #[test]
+    fn tape_engine_clears_all_bits() {
+        // Bits are typed Bool choices now; an always-failing property
+        // must shrink to the empty bit set, not to whatever raw byte
+        // bisection happens to leave behind.
+        let mut runner = tape_runner();
+        match runner.run(&u32::between(0, 32), |_| {
+            Err(crate::test_runner::TestCaseError::fail("always"))
+        }) {
+            Err(crate::test_runner::TestError::Fail(_, value)) => {
+                assert_eq!(0, value)
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tape_engine_shrinks_sampled_bitset_to_lowest_bits() {
+        // Count shrinks to the minimum and each selection shrinks to
+        // index 0 of the remaining free bits, so the minimal value has
+        // the lowest allowed bits set: bits {0, 1} == 3.
+        let mut runner = tape_runner();
+        match runner.run(&u32::sampled(2..=8, 0..32), |_| {
+            Err(crate::test_runner::TestCaseError::fail("always"))
+        }) {
+            Err(crate::test_runner::TestError::Fail(_, value)) => {
+                assert_eq!(3, value)
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 
     #[test]
     fn generates_values_in_range() {

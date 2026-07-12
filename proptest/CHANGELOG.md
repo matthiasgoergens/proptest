@@ -45,6 +45,13 @@
   were saved for; delete them or re-trigger the failures to repopulate.
   Tape entries (`ct1` lines, the new default) do not have this problem:
   they replay the recorded values themselves.
+- Bit-set strategies (`bits`, and `sample::subsequence` which is built
+  on them) record typed choices: one boolean per candidate bit, and for
+  sampled bit sets a typed count plus one typed selection per set bit.
+  Under the tape engine they now shrink bit-aware (clear bits, lower
+  the count, move set bits toward the start of the range) instead of
+  falling back to raw byte bisection. Values generated for a given seed
+  change as a result.
 
 ### Bug Fixes
 

@@ -295,6 +295,12 @@ impl IndexStrategy {
 /// iterator, ultimately settling on the very first, but this currently happens
 /// in a very haphazard way that may fail to find the earliest failing input.
 ///
+/// Because the selection happens lazily inside test code, driven by an
+/// RNG captured in the value, `Selector` sits outside the shrink
+/// engines entirely and its shrinking cannot be improved by the choice
+/// tape. Where the collection can be indexed, prefer [`Index`], which
+/// shrinks precisely under both engines.
+///
 /// ## Example
 ///
 /// Generate a non-indexable collection and a value to pick out of it.
@@ -424,6 +430,32 @@ mod test {
 
     use super::*;
     use crate::arbitrary::any;
+
+    #[test]
+    fn tape_engine_shrinks_subsequence_to_earliest_elements() {
+        // Subsequence rides on SampledBitSetStrategy; with typed
+        // choices, the minimal counterexample keeps the size-range
+        // minimum and the earliest elements.
+        let mut runner = crate::test_runner::TestRunner::new_with_rng(
+            crate::test_runner::Config {
+                shrink_engine: crate::test_runner::ShrinkEngine::Tape,
+                failure_persistence: None,
+                ..crate::test_runner::Config::default()
+            },
+            crate::test_runner::TestRng::deterministic_rng(
+                crate::test_runner::RngAlgorithm::default(),
+            ),
+        );
+        let strategy = subsequence(vec![10, 20, 30, 40, 50], 2..=4);
+        match runner.run(&strategy, |_| {
+            Err(crate::test_runner::TestCaseError::fail("always"))
+        }) {
+            Err(crate::test_runner::TestError::Fail(_, value)) => {
+                assert_eq!(vec![10, 20], value)
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 
     #[test]
     fn sample_slice() {
