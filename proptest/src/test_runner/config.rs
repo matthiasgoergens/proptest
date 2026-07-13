@@ -52,11 +52,60 @@ impl str::FromStr for ShrinkEngine {
     }
 }
 
+/// How the tape shrinker realigns when a shrink edit changes the shape
+/// of generation, so the recorded tape no longer lines up with what the
+/// generator now draws. On such a kind mismatch, `Freeze` holds the
+/// mismatched entry for a later same-kind draw while `Consume` skips it
+/// and resyncs; neither wins on every generator. `Both` (the default)
+/// replays a misaligned proposal under both and keeps the simpler
+/// still-failing result. It is never worse than either fixed policy,
+/// costs nothing on proposals that stay aligned (the common case), and
+/// reaches the canonical minimal example more often on shape-changing
+/// (`prop_flat_map`, union) generators. Only relevant under
+/// `ShrinkEngine::Tape`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShrinkRealign {
+    /// Hold the mismatched entry for a later same-kind draw.
+    Freeze,
+    /// Skip the mismatched entry and resync.
+    Consume,
+    /// Try both and keep the simpler still-failing result.
+    Both,
+}
+
+impl Default for ShrinkRealign {
+    fn default() -> Self {
+        ShrinkRealign::Both
+    }
+}
+
+impl str::FromStr for ShrinkRealign {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "freeze" => Ok(ShrinkRealign::Freeze),
+            "consume" => Ok(ShrinkRealign::Consume),
+            "both" => Ok(ShrinkRealign::Both),
+            _ => Err(()),
+        }
+    }
+}
+
 impl fmt::Display for ShrinkEngine {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ShrinkEngine::ValueTree => write!(f, "valuetree"),
             ShrinkEngine::Tape => write!(f, "tape"),
+        }
+    }
+}
+
+impl fmt::Display for ShrinkRealign {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ShrinkRealign::Freeze => write!(f, "freeze"),
+            ShrinkRealign::Consume => write!(f, "consume"),
+            ShrinkRealign::Both => write!(f, "both"),
         }
     }
 }
@@ -86,6 +135,7 @@ pub fn contextualize_config(mut result: Config) -> Config {
     const RNG_ALGORITHM: &str = "PROPTEST_RNG_ALGORITHM";
     const RNG_SEED: &str = "PROPTEST_RNG_SEED";
     const SHRINK_ENGINE: &str = "PROPTEST_SHRINK_ENGINE";
+    const SHRINK_REALIGN: &str = "PROPTEST_SHRINK_REALIGN";
     const DISABLE_FAILURE_PERSISTENCE: &str =
         "PROPTEST_DISABLE_FAILURE_PERSISTENCE";
 
@@ -193,6 +243,13 @@ pub fn contextualize_config(mut result: Config) -> Config {
                 "ShrinkEngine (valuetree|tape)",
                 SHRINK_ENGINE,
             );
+        } else if var == SHRINK_REALIGN {
+            parse_or_warn(
+                &value,
+                &mut result.shrink_realign,
+                "ShrinkRealign (freeze|consume|both)",
+                SHRINK_REALIGN,
+            );
         } else if var == DISABLE_FAILURE_PERSISTENCE {
             result.failure_persistence = None;
         } else if var.starts_with("PROPTEST_") {
@@ -232,6 +289,7 @@ fn default_default_config() -> Config {
         rng_algorithm: RngAlgorithm::default(),
         rng_seed: RngSeed::Random,
         shrink_engine: ShrinkEngine::default(),
+        shrink_realign: ShrinkRealign::default(),
         _non_exhaustive: (),
     }
 }
@@ -499,6 +557,14 @@ pub struct Config {
     /// `tape`. (The variable is only considered when the `std` feature is
     /// enabled, which it is by default.)
     pub shrink_engine: ShrinkEngine,
+
+    /// How the tape shrinker realigns when a shrink edit changes the
+    /// shape of generation (only under `ShrinkEngine::Tape`).
+    ///
+    /// The default is `ShrinkRealign::Both`. Override with the
+    /// `PROPTEST_SHRINK_REALIGN` environment variable set to `freeze`,
+    /// `consume`, or `both` (considered only with the `std` feature).
+    pub shrink_realign: ShrinkRealign,
 
     // Needs to be public so FRU syntax can be used.
     #[doc(hidden)]

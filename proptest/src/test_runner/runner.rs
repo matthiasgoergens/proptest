@@ -39,7 +39,7 @@ use crate::test_runner::reason::*;
 use crate::test_runner::replay;
 use crate::test_runner::result_cache::*;
 use crate::test_runner::rng::TestRng;
-use crate::test_runner::tape::{self, Choice, Tape, TapeInt};
+use crate::test_runner::tape::{self, Choice, ReplayPolicy, Tape, TapeInt};
 
 #[cfg(feature = "fork")]
 const ENV_FORK_FILE: &'static str = "_PROPTEST_FORKFILE";
@@ -1748,7 +1748,7 @@ impl TestRunner {
                 )));
             }
         };
-        let (output, _overrun) = self.rng.tape.finish_replay();
+        let (output, _overrun, _misaligned) = self.rng.tape.finish_replay();
 
         if ShrinkEngine::Tape == self.config.shrink_engine
             && !self.config.fork()
@@ -1821,8 +1821,79 @@ impl TestRunner {
             return TapeAttemptResult::Exhausted;
         }
 
+        // One logical proposal = one budget tick regardless of how many
+        // realignment policies we replay it under (shrinking is off the
+        // happy path; spend to hand a human a smaller example). The
+        // primary policy reproduces today's behavior on aligned
+        // proposals; `Both` also tries the other, but only when the
+        // primary replay actually misaligned.
+        let (primary, try_secondary) = match self.config.shrink_realign {
+            ShrinkRealign::Freeze => (ReplayPolicy::Freeze, false),
+            ShrinkRealign::Consume => (ReplayPolicy::Consume, false),
+            ShrinkRealign::Both => (ReplayPolicy::Freeze, true),
+        };
+        let secondary = ReplayPolicy::Consume;
+
+        let (mis1, cand1) = self.tape_replay_candidate(
+            strategy,
+            test,
+            rng_snapshot,
+            proposal.clone(),
+            primary,
+            &best.tape,
+            result_cache,
+            fork_output,
+        );
+        let mut candidates: Vec<(Tape, S::Tree, Reason)> = Vec::new();
+        if let Some(c) = cand1 {
+            candidates.push(c);
+        }
+        if try_secondary && mis1 {
+            let (_mis2, cand2) = self.tape_replay_candidate(
+                strategy,
+                test,
+                rng_snapshot,
+                proposal,
+                secondary,
+                &best.tape,
+                result_cache,
+                fork_output,
+            );
+            if let Some(c) = cand2 {
+                candidates.push(c);
+            }
+        }
+
+        match candidates
+            .into_iter()
+            .min_by(|(a, _, _), (b, _, _)| a.cmp_key(b))
+        {
+            Some((output, tree, why)) => {
+                best.tape = output;
+                best.tree = tree;
+                best.why = why;
+                TapeAttemptResult::Accepted
+            }
+            None => TapeAttemptResult::Rejected,
+        }
+    }
+
+    /// Replay `proposal` under one realignment `policy`; return whether
+    /// it misaligned and, if it is a still-failing candidate strictly
+    /// simpler than `best_tape`, its `(output tape, tree, reason)`.
+    fn tape_replay_candidate<S: Strategy>(
+        &mut self,
+        strategy: &S,
+        test: &impl Fn(S::Value) -> TestCaseResult,
+        rng_snapshot: &TestRng,
+        proposal: Tape,
+        policy: ReplayPolicy,
+        best_tape: &Tape,
+        result_cache: &mut dyn ResultCache,
+        fork_output: &mut ForkOutput,
+    ) -> (bool, Option<(Tape, S::Tree, Reason)>) {
         self.rng = rng_snapshot.clone();
-        self.rng.tape.start_replay(proposal);
+        self.rng.tape.start_replay_with(proposal, policy);
         // Local rejects incurred while re-vetting a shrink proposal (e.g.
         // a filter refusing edited values) must not drain the run-wide
         // budget: the classic shrinker never consumes it while shrinking,
@@ -1832,18 +1903,18 @@ impl TestRunner {
         let local_rejects_before = self.local_rejects;
         let tree = strategy.new_tree(self);
         self.local_rejects = local_rejects_before;
-        let (output, overrun) = self.rng.tape.finish_replay();
+        let (output, overrun, misaligned) = self.rng.tape.finish_replay();
         let tree = match tree {
             Ok(tree) => tree,
             // Generation rejected the replayed values (e.g. a filter's
-            // retry budget ran out); discard the attempt.
-            Err(_) => return TapeAttemptResult::Rejected,
+            // retry budget ran out); discard this candidate.
+            Err(_) => return (misaligned, None),
         };
         if overrun {
-            return TapeAttemptResult::Rejected;
+            return (misaligned, None);
         }
-        if Ordering::Less != output.cmp_key(&best.tape) {
-            return TapeAttemptResult::Rejected;
+        if Ordering::Less != output.cmp_key(best_tape) {
+            return (misaligned, None);
         }
 
         let result = call_test(
@@ -1857,15 +1928,10 @@ impl TestRunner {
         );
         match result {
             Err(TestCaseError::Fail(why)) => {
-                best.tape = output;
-                best.tree = tree;
-                best.why = why;
-                TapeAttemptResult::Accepted
+                (misaligned, Some((output, tree, why)))
             }
             // Passes and rejections both mean the edit lost the failure.
-            Ok(_) | Err(TestCaseError::Reject(..)) => {
-                TapeAttemptResult::Rejected
-            }
+            Ok(_) | Err(TestCaseError::Reject(..)) => (misaligned, None),
         }
     }
 
@@ -3091,6 +3157,102 @@ mod test {
             } else {
                 panic!("Incorrect result: {:?}", result);
             }
+        }
+    }
+
+    // A shape-changing generator: a bool tag picks (i32,i32) [sum test]
+    // or (bool^2,i32,i32) [sum test]. Flipping the tag during shrinking
+    // changes the kinds that follow, so replay misaligns. Under the
+    // Consume policy the two ints survive the shape flip; under Freeze
+    // they are scrambled, so Consume (and Both) reach the canonical
+    // one-branch minimum more often than Freeze alone.
+    #[cfg(feature = "std")]
+    fn realign_shape_strategy(
+    ) -> crate::strategy::BoxedStrategy<(bool, i32, i32)> {
+        use crate::arbitrary::any;
+        any::<bool>()
+            .prop_flat_map(|tag| {
+                if tag {
+                    (any::<bool>(), any::<bool>(), 0i32..1000, 0i32..1000)
+                        .prop_map(|(_, _, a, b)| (true, a, b))
+                        .boxed()
+                } else {
+                    (0i32..1000, 0i32..1000)
+                        .prop_map(|(a, b)| (false, a, b))
+                        .boxed()
+                }
+            })
+            .boxed()
+    }
+
+    #[cfg(feature = "std")]
+    fn realign_minimal(realign: ShrinkRealign, seed: u64) -> (bool, i32, i32) {
+        let mut bytes = [0u8; 32];
+        bytes[..8]
+            .copy_from_slice(&seed.wrapping_mul(0x9e37_79b9).to_le_bytes());
+        let mut runner = TestRunner::new_with_rng(
+            Config {
+                shrink_engine: ShrinkEngine::Tape,
+                shrink_realign: realign,
+                cases: 400,
+                max_shrink_iters: 8000,
+                failure_persistence: None,
+                ..Config::default()
+            },
+            TestRng::from_seed(RngAlgorithm::ChaCha, &bytes),
+        );
+        match runner.run(&realign_shape_strategy(), |(_, a, b)| {
+            if a + b >= 100 {
+                Err(TestCaseError::fail("sum"))
+            } else {
+                Ok(())
+            }
+        }) {
+            Err(TestError::Fail(_, v)) => v,
+            other => panic!("expected failure, got {:?}", other),
+        }
+    }
+
+    // `Both` reaches the canonical one-branch minimum (false, 0, 100) at
+    // least as often as either fixed policy, and strictly more often
+    // than Freeze (proptest's historical policy) on this generator.
+    #[cfg(feature = "std")]
+    #[test]
+    fn realign_both_beats_freeze_on_shape_change() {
+        let seeds = 0..60u64;
+        let canonical = |realign| {
+            seeds
+                .clone()
+                .filter(|&s| realign_minimal(realign, s) == (false, 0, 100))
+                .count()
+        };
+        let freeze = canonical(ShrinkRealign::Freeze);
+        let consume = canonical(ShrinkRealign::Consume);
+        let both = canonical(ShrinkRealign::Both);
+        assert!(
+            both >= freeze && both >= consume,
+            "Both should match the best fixed policy:              both={} freeze={} consume={}",
+            both,
+            freeze,
+            consume
+        );
+        assert!(
+            both > freeze,
+            "Both should beat Freeze on a consume-favouring shape change:              both={} freeze={}",
+            both,
+            freeze
+        );
+    }
+
+    // `Both` is deterministic: same seed, same minimal every time,
+    // despite doing a second replay on misaligned proposals.
+    #[cfg(feature = "std")]
+    #[test]
+    fn realign_both_is_deterministic() {
+        for seed in [1u64, 7, 23, 42] {
+            let a = realign_minimal(ShrinkRealign::Both, seed);
+            let b = realign_minimal(ShrinkRealign::Both, seed);
+            assert_eq!(a, b, "Both must be deterministic for seed {}", seed);
         }
     }
 }

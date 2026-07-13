@@ -298,6 +298,20 @@ impl Tape {
     }
 }
 
+/// How replay handles a kind mismatch (the input choice at the cursor
+/// is a different kind than the draw asking for it, because a shrink
+/// edit changed the shape of generation). Neither wins universally:
+/// `Freeze` holds the mismatched entry for a later same-kind draw;
+/// `Consume` skips it and resyncs. The shrinker can try both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplayPolicy {
+    /// Leave the cursor put and sample this draw fresh (proptest's
+    /// historical behavior).
+    Freeze,
+    /// Skip the mismatched entry and retry at the next position.
+    Consume,
+}
+
 /// Recording/replaying state, owned by `TestRng` so that both the typed
 /// draws on `TestRunner` and the raw `RngCore` calls write to the same tape.
 #[derive(Clone, Debug)]
@@ -311,6 +325,10 @@ pub(crate) enum TapeMode {
         cursor: usize,
         output: Tape,
         overrun: bool,
+        /// Set once any draw skipped or fresh-sampled over a kind
+        /// mismatch: the replay did not line up with the recorded tape.
+        misaligned: bool,
+        policy: ReplayPolicy,
     },
 }
 
@@ -377,24 +395,38 @@ impl TapeState {
     }
 
     pub(crate) fn start_replay(&mut self, input: Tape) {
+        self.start_replay_with(input, ReplayPolicy::Freeze);
+    }
+
+    pub(crate) fn start_replay_with(
+        &mut self,
+        input: Tape,
+        policy: ReplayPolicy,
+    ) {
         self.mode = TapeMode::Replaying {
             input,
             cursor: 0,
             output: Tape::default(),
             overrun: false,
+            misaligned: false,
+            policy,
         };
         self.span_stack.clear();
     }
 
-    /// Stop replaying and return the re-recorded output tape plus whether
-    /// the input was overrun. Returns an empty tape if not replaying.
-    pub(crate) fn finish_replay(&mut self) -> (Tape, bool) {
+    /// Stop replaying and return the re-recorded output tape, whether the
+    /// input was overrun, and whether any draw hit a kind mismatch.
+    /// Returns an empty tape if not replaying.
+    pub(crate) fn finish_replay(&mut self) -> (Tape, bool, bool) {
         self.span_stack.clear();
         match core::mem::replace(&mut self.mode, TapeMode::Off) {
             TapeMode::Replaying {
-                output, overrun, ..
-            } => (output, overrun),
-            _ => (Tape::default(), false),
+                output,
+                overrun,
+                misaligned,
+                ..
+            } => (output, overrun, misaligned),
+            _ => (Tape::default(), false, false),
         }
     }
 
@@ -496,12 +528,14 @@ impl TapeState {
     /// replaying.
     pub(crate) fn pop_replay(
         &mut self,
-        matcher: impl FnOnce(&Choice) -> bool,
+        matcher: impl Fn(&Choice) -> bool,
     ) -> Option<Choice> {
         if let TapeMode::Replaying {
             input,
             cursor,
             overrun,
+            misaligned,
+            policy,
             ..
         } = &mut self.mode
         {
@@ -514,8 +548,31 @@ impl TapeState {
                 *cursor += 1;
                 return Some(choice);
             }
+            // Kind mismatch: the recorded shape no longer matches.
+            *misaligned = true;
+            match *policy {
+                // Hold the entry for a later same-kind draw; this draw
+                // samples fresh.
+                ReplayPolicy::Freeze => None,
+                // Skip past the mismatched entry (and any run of
+                // mismatches) and take the next matching one, if any.
+                ReplayPolicy::Consume => {
+                    *cursor += 1;
+                    while *cursor < input.choices.len() {
+                        if matcher(&input.choices[*cursor]) {
+                            let choice = input.choices[*cursor].clone();
+                            *cursor += 1;
+                            return Some(choice);
+                        }
+                        *cursor += 1;
+                    }
+                    *overrun = true;
+                    None
+                }
+            }
+        } else {
+            None
         }
-        None
     }
 }
 
@@ -1491,7 +1548,7 @@ mod test {
             None,
             state.pop_replay(|c| matches!(c, Choice::RawU32 { .. }))
         );
-        let (output, overrun) = state.finish_replay();
+        let (output, overrun, _misaligned) = state.finish_replay();
         assert!(overrun);
         assert!(output.choices.is_empty());
     }
