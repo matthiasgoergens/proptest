@@ -97,3 +97,92 @@ appends before and after each test call.
   fork per ATTEMPT for full isolation. Not needed for parity with
   today's behavior (child crashes are already handled), revisit only if
   crash-heavy shrinking proves slow.
+
+---
+
+## Worked-out protocol (2026-07-14, refined during implementation)
+
+The format is implemented and unit-tested (`test_runner/tape_replay.rs`).
+Working out the wiring surfaced one subtlety that shapes the record
+stream, recorded here so the implementation is unambiguous.
+
+### The B-reanchor rule (the subtlety)
+
+Records are appended across the crash boundary: a child dies leaving a
+dangling `C`/`A` (no `=`), then a *fresh* child appends more records
+after it. If the fresh child just continued, the parser would see a
+`C`/`A` with no `=` followed by unrelated later records, and the crash
+input's tape would be lost (overwritten by the next `C`/`A`'s pending
+slot) rather than promoted to best.
+
+Rule: **a recovering child writes `B <best>` as its very first
+record.** On startup it parses the forkfile, folds any dangling record
+into `best` (a crashing input is a failure worth keeping), and
+re-anchors by emitting that best as a `B`. This keeps `best` explicit
+and monotone across every crash, and makes the parser's "last `B`
+wins" the whole truth except for a truly-final dangling record (the
+current child's own crash), which folds in at EOF as before.
+
+### Child algorithm (`run_in_process` in tape+fork mode)
+
+1. Parse forkfile → `ForkState { seed, best, cases_done, .. }`.
+   `set_seed(seed)`.
+2. If `best` is `None` (generation phase): fast-forward generation by
+   `cases_done` cases (generate-without-test, advancing the rng
+   identically), then run the normal generation loop from there,
+   emitting `C <tape>` before each test and `= <status>` after. The
+   first failing case becomes `best` (recorded as its `C`/`= -`); go
+   to 3. If `cases` is exhausted with no failure, emit `.` and exit
+   (the parent reports "no failure").
+3. Shrink phase: emit `B <best>` (re-anchor). Replay `best` to a tree,
+   run the tape shrink loop from it, emitting `A <proposal>` before
+   each attempt, `= <status>` after, and `B <new best>` on each
+   accepted improvement. On fixpoint/budget, emit `.` and exit.
+
+Crash handling is implicit: a child that dies mid-test leaves its `C`
+or `A` dangling at EOF.
+
+### Parent algorithm (`run_in_fork` in tape mode)
+
+1. Create forkfile; `tape_replay::init_file(seed)`.
+2. Loop: fork a child (the child runs the algorithm above). On return,
+   parse:
+   - `Terminated(state)` → break with `state.best`.
+   - `InProgress(state)` → the child died; `state.best` already folds
+     the crash input. Re-fork (the next child re-anchors from `best`).
+   - `Corrupt` → panic (child corrupted the file).
+   Cap re-forks at 10000 as today.
+3. Final reconstruction: if `best` is `Some`, replay it once (generate
+   the value; no re-shrink — the children did the shrinking) and
+   return `TestError::Fail(reason, value)`, persisting the `ct1` entry.
+   `reason` notes crash-provenance when `best_from_crash`. If `best`
+   is `None`, the run passed.
+
+This deletes the `!fork()` guard on the tape path and lets fork/timeout
+failures persist as replayable `ct1` tapes.
+
+### ForkOutput seam
+
+`ForkOutput` gains a format tag. In tape mode: `append` (the per-test
+char, called by `call_test`) becomes a no-op (the tape path records
+`C`/`A` + `=` explicitly, so the char stream must not corrupt the tape
+file); new `record_case`/`record_attempt`/`record_best`/
+`record_status` write tape records. In classic mode everything is as
+today. The recording calls live in `gen_and_run_case_tape` (case + its
+status) and `tape_attempt`/`tape_shrink` (attempt, status, best).
+
+### Verification layers (agreed)
+
+- L0 format: DONE, 7 unit tests, in-process.
+- L1 child recording: run the tape engine in-process with a
+  tempfile-backed tape `ForkOutput`; parse the file back; assert the
+  record stream is well-formed, `best` == the shrink result, and every
+  `B` is strictly shortlex-smaller than the previous.
+- L2 parent recovery: synthesize forkfiles crashed at each point; drive
+  the recovery + final-replay; assert the recovered best and value.
+- L3 end-to-end fork: a `mod timeout_tests` test where the tape-engine
+  test body `process::abort()`s (crash) or sleeps past the timeout on
+  some inputs; assert convergence to the expected minimal across
+  re-forks. Also eyeball a real child's record stream against L1's.
+- Regression: classic ValueTree fork protocol untouched; existing
+  fork/timeout tests green; tape non-fork behavior unchanged (1557/0).
