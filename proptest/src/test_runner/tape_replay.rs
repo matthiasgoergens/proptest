@@ -165,7 +165,7 @@ fn tape_of_hex(hex: &str) -> Option<Tape> {
     if hex.len() % 2 != 0 {
         return None;
     }
-    let mut bytes = vec![0u8; hex.len() / 2];
+    let mut bytes: Vec<u8> = vec![0u8; hex.len() / 2];
     from_base16(&mut bytes, hex)?;
     deserialize_tape(&bytes)
 }

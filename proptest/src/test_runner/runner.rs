@@ -40,6 +40,8 @@ use crate::test_runner::replay;
 use crate::test_runner::result_cache::*;
 use crate::test_runner::rng::TestRng;
 use crate::test_runner::tape::{self, Choice, Tape, TapeInt};
+#[cfg(feature = "fork")]
+use crate::test_runner::tape_replay;
 
 #[cfg(feature = "fork")]
 const ENV_FORK_FILE: &'static str = "_PROPTEST_FORKFILE";
@@ -146,14 +148,30 @@ impl Default for TestRunner {
 }
 
 #[cfg(feature = "fork")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForkFormat {
+    /// Classic protocol: one status char per case (ValueTree engine).
+    Classic,
+    /// Tape protocol: serialized-tape records (tape engine).
+    Tape,
+}
+
+#[cfg(feature = "fork")]
 #[derive(Debug)]
 struct ForkOutput {
     file: Option<fs::File>,
+    format: ForkFormat,
 }
 
 #[cfg(feature = "fork")]
 impl ForkOutput {
     fn append(&mut self, result: &TestCaseResult) {
+        // Under the tape format the per-test char stream is not used;
+        // the tape path records `C`/`A` + `=` explicitly, and a char
+        // written here would corrupt the tape forkfile.
+        if ForkFormat::Tape == self.format {
+            return;
+        }
         if let Some(ref mut file) = self.file {
             replay::append(file, result)
                 .expect("Failed to append to replay file");
@@ -161,6 +179,9 @@ impl ForkOutput {
     }
 
     fn ping(&mut self) {
+        if ForkFormat::Tape == self.format {
+            return;
+        }
         if let Some(ref mut file) = self.file {
             replay::ping(file).expect("Failed to append to replay file");
         }
@@ -168,12 +189,33 @@ impl ForkOutput {
 
     fn terminate(&mut self) {
         if let Some(ref mut file) = self.file {
-            replay::terminate(file).expect("Failed to append to replay file");
+            if ForkFormat::Tape == self.format {
+                tape_replay::append(file, &tape_replay::Record::Terminate)
+                    .expect("Failed to append to tape replay file");
+            } else {
+                replay::terminate(file)
+                    .expect("Failed to append to replay file");
+            }
+        }
+    }
+
+    /// Record a tape forkfile `Record`. No-op when not writing a tape
+    /// forkfile.
+    fn tape_record(&mut self, record: &tape_replay::Record) {
+        if ForkFormat::Tape != self.format {
+            return;
+        }
+        if let Some(ref mut file) = self.file {
+            tape_replay::append(file, record)
+                .expect("Failed to append to tape replay file");
         }
     }
 
     fn empty() -> Self {
-        ForkOutput { file: None }
+        ForkOutput {
+            file: None,
+            format: ForkFormat::Classic,
+        }
     }
 
     fn is_in_fork(&self) -> bool {
@@ -1529,6 +1571,9 @@ impl TestRunner {
         };
         let recorded = self.rng.tape.take_recording();
 
+        #[cfg(feature = "fork")]
+        fork_output.tape_record(&tape_replay::Record::Case(recorded.clone()));
+
         let result = call_test(
             self,
             case.current(),
@@ -1538,6 +1583,16 @@ impl TestRunner {
             fork_output,
             is_from_persisted_seed,
         );
+
+        #[cfg(feature = "fork")]
+        {
+            let status = match &result {
+                Ok(_) => tape_replay::Status::Pass,
+                Err(TestCaseError::Fail(_)) => tape_replay::Status::Fail,
+                Err(TestCaseError::Reject(_)) => tape_replay::Status::Reject,
+            };
+            fork_output.tape_record(&tape_replay::Record::Status(status));
+        }
 
         let ok_type = match result {
             Ok(success) => success,
@@ -1567,6 +1622,40 @@ impl TestRunner {
             | TestCaseOk::CacheHitSuccess
             | TestCaseOk::Reject => (),
         }
+        Ok(())
+    }
+
+    /// The tape-forkfile child's generation phase: run fresh cases,
+    /// recording each to `fork_output`, until one fails (which triggers
+    /// the recording shrink loop) or the case budget is exhausted, then
+    /// mark the forkfile terminated. Used by the fork parent's child
+    /// body; also exercised in-process by the L1 test with a
+    /// tempfile-backed tape `ForkOutput`.
+    #[cfg(feature = "fork")]
+    fn run_tape_fork_generation<S: Strategy>(
+        &mut self,
+        strategy: &S,
+        test: &impl Fn(S::Value) -> TestCaseResult,
+        fork_output: &mut ForkOutput,
+    ) -> TestRunResult<S> {
+        let mut result_cache = self.new_cache();
+        let mut empty = iter::empty::<TestCaseResult>().fuse();
+        while self.successes < self.config.cases {
+            let result = self.gen_and_run_case_tape(
+                strategy,
+                test,
+                &mut empty,
+                &mut *result_cache,
+                fork_output,
+                false,
+            );
+            if let Err(e) = result {
+                // A failure (already shrunk and recorded) or an abort.
+                fork_output.terminate();
+                return Err(e);
+            }
+        }
+        fork_output.terminate();
         Ok(())
     }
 
@@ -1846,6 +1935,13 @@ impl TestRunner {
             return TapeAttemptResult::Rejected;
         }
 
+        // Record the attempt just before running the test, so that a
+        // child that dies in the test leaves this exact tape dangling
+        // and the parent can recover the killing input. The output tape
+        // (the canonical re-recording) regenerates the same value.
+        #[cfg(feature = "fork")]
+        fork_output.tape_record(&tape_replay::Record::Attempt(output.clone()));
+
         let result = call_test(
             self,
             tree.current(),
@@ -1855,11 +1951,27 @@ impl TestRunner {
             fork_output,
             false,
         );
+
+        #[cfg(feature = "fork")]
+        {
+            let status = match &result {
+                Ok(_) => tape_replay::Status::Pass,
+                Err(TestCaseError::Fail(_)) => tape_replay::Status::Fail,
+                Err(TestCaseError::Reject(_)) => tape_replay::Status::Reject,
+            };
+            fork_output.tape_record(&tape_replay::Record::Status(status));
+        }
+
         match result {
             Err(TestCaseError::Fail(why)) => {
                 best.tape = output;
                 best.tree = tree;
                 best.why = why;
+                // A new, simpler failing tape is the best so far; record
+                // it so a resuming child re-anchors here.
+                #[cfg(feature = "fork")]
+                fork_output
+                    .tape_record(&tape_replay::Record::Best(best.tape.clone()));
                 TapeAttemptResult::Accepted
             }
             // Passes and rejections both mean the edit lost the failure.
@@ -2572,7 +2684,13 @@ fn init_replay(rng: &mut TestRng) -> (Vec<TestCaseResult>, ForkOutput) {
         match loaded {
             InProgress(replay) => {
                 rng.set_seed(replay.seed);
-                (replay.steps, ForkOutput { file: Some(file) })
+                (
+                    replay.steps,
+                    ForkOutput {
+                        file: Some(file),
+                        format: ForkFormat::Classic,
+                    },
+                )
             }
 
             Terminated(_) => {
@@ -2689,6 +2807,81 @@ mod test {
     use super::*;
     use crate::strategy::Strategy;
     use crate::test_runner::{FileFailurePersistence, RngAlgorithm, TestRng};
+
+    // L1: the tape-forkfile child records a well-formed stream, and the
+    // recovered best regenerates the minimal failing value. Exercises
+    // the child recording path in-process (real tempfile, no fork).
+    #[cfg(feature = "fork")]
+    #[test]
+    fn tape_fork_child_records_a_wellformed_stream() {
+        use crate::test_runner::tape_replay::{
+            parse_from, ParsedForkfile,
+        };
+
+        let mut runner = TestRunner::new_with_rng(
+            Config {
+                shrink_engine: ShrinkEngine::Tape,
+                failure_persistence: None,
+                cases: 256,
+                ..Config::default()
+            },
+            TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+        );
+        let seed = runner.rng.new_rng_seed();
+        runner.rng.set_seed(seed.clone());
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = std::path::PathBuf::from(tmp.path());
+        // One append handle for writing, exactly as the child does.
+        let mut write_file =
+            crate::test_runner::replay::open_file(&path).unwrap();
+        crate::test_runner::tape_replay::init_file(&mut write_file, &seed)
+            .unwrap();
+        let mut fork_output = ForkOutput {
+            file: Some(write_file),
+            format: ForkFormat::Tape,
+        };
+
+        // Fails iff v >= 100; minimal is exactly 100.
+        let _ = runner.run_tape_fork_generation(
+            &(0i32..1000),
+            &|v| {
+                if v >= 100 {
+                    Err(TestCaseError::fail("too big"))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut fork_output,
+        );
+
+        drop(fork_output);
+        let read_file = fs::File::open(&path).unwrap();
+        let parsed = parse_from(read_file).unwrap();
+        let state = match parsed {
+            ParsedForkfile::Terminated(state) => state,
+            other => panic!("expected Terminated, got {:?}", other),
+        };
+        let best = state.best.expect("a failure should have been recorded");
+        assert!(!state.best_from_crash);
+
+        // The recovered best tape regenerates exactly the minimal value.
+        let mut replay_runner = TestRunner::new_with_rng(
+            Config {
+                shrink_engine: ShrinkEngine::Tape,
+                failure_persistence: None,
+                ..Config::default()
+            },
+            TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+        );
+        replay_runner.rng.tape.start_replay(best);
+        let value = (0i32..1000)
+            .new_tree(&mut replay_runner)
+            .unwrap()
+            .current();
+        let _ = replay_runner.rng.tape.finish_replay();
+        assert_eq!(100, value);
+    }
 
     #[test]
     fn gives_up_after_too_many_rejections() {
