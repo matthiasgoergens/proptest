@@ -158,6 +158,11 @@ pub(crate) struct ForkState {
     /// child skip re-running the passing prefix of the generation
     /// phase.
     pub(crate) cases_done: usize,
+    /// Total `=` status records (case or attempt). Zero means no test
+    /// ever completed without the child dying, i.e. the child cannot
+    /// run even one case (as opposed to finding a real failure), which
+    /// the parent treats as "failed to start".
+    pub(crate) statuses_recorded: usize,
 }
 
 fn tape_of_hex(hex: &str) -> Option<Tape> {
@@ -193,6 +198,7 @@ pub(crate) fn parse_from(
     let mut best: Option<Tape> = None;
     let mut best_from_crash = false;
     let mut cases_done = 0usize;
+    let mut statuses_recorded = 0usize;
     // The tape of a `Case`/`Attempt` record awaiting its `=` status.
     let mut pending: Option<(bool /* is_attempt */, Tape)> = None;
     let mut terminated = false;
@@ -235,6 +241,7 @@ pub(crate) fn parse_from(
                 best_from_crash = false;
             }
             "=" => {
+                statuses_recorded += 1;
                 let status =
                     rest.chars().next().and_then(Status::from_char);
                 let (is_attempt, tape) = match pending.take() {
@@ -282,6 +289,7 @@ pub(crate) fn parse_from(
         best,
         best_from_crash,
         cases_done,
+        statuses_recorded,
     };
     Ok(if terminated {
         ParsedForkfile::Terminated(state)

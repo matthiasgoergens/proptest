@@ -480,6 +480,12 @@ impl TestRunner {
         test: impl Fn(S::Value) -> TestCaseResult,
     ) -> TestRunResult<S> {
         if self.config.fork() {
+            #[cfg(feature = "fork")]
+            {
+                if ShrinkEngine::Tape == self.config.shrink_engine {
+                    return self.run_in_fork_tape(strategy, test);
+                }
+            }
             self.run_in_fork(strategy, test)
         } else {
             self.run_in_process(strategy, test)
@@ -633,6 +639,248 @@ impl TestRunner {
         )
     }
 
+    /// The tape-forkfile child body (runs in the forked child). Reads
+    /// the forkfile named by `ENV_FORK_FILE`, and either resumes
+    /// shrinking from the recorded best or, if no failure has been
+    /// found yet, runs the generation phase.
+    #[cfg(feature = "fork")]
+    fn run_tape_fork_child<S: Strategy>(
+        &mut self,
+        strategy: &S,
+        test: impl Fn(S::Value) -> TestCaseResult,
+    ) -> TestRunResult<S> {
+        use crate::test_runner::tape_replay::{parse_from, ParsedForkfile};
+
+        let path = env::var_os(ENV_FORK_FILE)
+            .expect("tape fork child without a forkfile");
+        let read_file =
+            replay::open_file(&path).expect("Failed to open tape forkfile");
+        let state = match parse_from(read_file)
+            .expect("Failed to read tape forkfile")
+        {
+            ParsedForkfile::InProgress(state) => state,
+            ParsedForkfile::Terminated(_) => {
+                panic!("Tape forkfile for child is already terminated")
+            }
+            ParsedForkfile::Corrupt => {
+                panic!("Tape forkfile for child is corrupt")
+            }
+        };
+        self.rng.set_seed(state.seed);
+
+        let write_file = replay::open_file(&path)
+            .expect("Failed to open tape forkfile for append");
+        let mut fork_output = ForkOutput {
+            file: Some(write_file),
+            format: ForkFormat::Tape,
+        };
+
+        match state.best {
+            Some(best) => {
+                self.run_tape_fork_resume(strategy, &test, best, &mut fork_output)
+            }
+            None => {
+                self.run_tape_fork_generation(strategy, &test, &mut fork_output)
+            }
+        }
+    }
+
+    /// Resume shrinking from a recovered best tape: re-anchor it as a
+    /// `B` record (so it stays explicit across any further crash),
+    /// replay it to a tree, and run the recording shrink loop.
+    #[cfg(feature = "fork")]
+    fn run_tape_fork_resume<S: Strategy>(
+        &mut self,
+        strategy: &S,
+        test: &impl Fn(S::Value) -> TestCaseResult,
+        best: Tape,
+        fork_output: &mut ForkOutput,
+    ) -> TestRunResult<S> {
+        fork_output.tape_record(&tape_replay::Record::Best(best.clone()));
+
+        let rng_snapshot = self.rng.clone();
+        self.rng.tape.start_replay(best);
+        let tree = match strategy.new_tree(self) {
+            Ok(tree) => tree,
+            Err(msg) => {
+                self.rng.tape.finish_replay();
+                fork_output.terminate();
+                return Err(TestError::Abort(msg));
+            }
+        };
+        let (output, _overrun) = self.rng.tape.finish_replay();
+
+        let mut result_cache = self.new_cache();
+        let (_why, _value) = self.tape_shrink(
+            strategy,
+            test,
+            rng_snapshot,
+            output,
+            tree,
+            "resumed tape shrink".into(),
+            &mut *result_cache,
+            fork_output,
+        );
+        fork_output.terminate();
+        Ok(())
+    }
+
+    /// Fork parent for the tape engine: like `run_in_fork` but the
+    /// forkfile records tapes, so a child that dies mid-shrink leaves
+    /// the killing input behind and a fresh child resumes from the best
+    /// tape. The final reconstruction replays that tape (no
+    /// deterministic case-replay needed).
+    #[cfg(feature = "fork")]
+    fn run_in_fork_tape<S: Strategy>(
+        &mut self,
+        strategy: &S,
+        test: impl Fn(S::Value) -> TestCaseResult,
+    ) -> TestRunResult<S> {
+        use crate::test_runner::tape_replay::{parse_from, ParsedForkfile};
+
+        let mut test = Some(test);
+        let test_name = rusty_fork::fork_test::fix_module_path(
+            self.config
+                .test_name
+                .expect("Must supply test_name when forking enabled"),
+        );
+        let forkfile: RefCell<Option<tempfile::NamedTempFile>> =
+            RefCell::new(None);
+        let init_forkfile_size = Cell::new(0u64);
+        let seed = self.rng.new_rng_seed();
+        let timeout = self.config.timeout();
+        let mut child_count = 0;
+
+        fn forkfile_size(forkfile: &Option<tempfile::NamedTempFile>) -> u64 {
+            forkfile.as_ref().map_or(0, |ff| {
+                ff.as_file().metadata().map(|md| md.len()).unwrap_or(0)
+            })
+        }
+
+        let final_state = loop {
+            let (_child_error, _last_len) = rusty_fork::fork(
+                test_name,
+                rusty_fork_id!(),
+                |cmd| {
+                    let mut forkfile = forkfile.borrow_mut();
+                    if forkfile.is_none() {
+                        let mut ff = tempfile::NamedTempFile::new().expect(
+                            "Failed to create temporary file for fork",
+                        );
+                        tape_replay::init_file(ff.as_file_mut(), &seed).expect(
+                            "Failed to initialise tape forkfile",
+                        );
+                        *forkfile = Some(ff);
+                    }
+                    init_forkfile_size.set(forkfile_size(&forkfile));
+                    cmd.env(ENV_FORK_FILE, forkfile.as_ref().unwrap().path());
+                },
+                |child, _| {
+                    await_child(
+                        child,
+                        &mut forkfile.borrow_mut().as_mut().unwrap(),
+                        timeout,
+                    )
+                },
+                || match self
+                    .run_tape_fork_child(strategy, test.take().unwrap())
+                {
+                    Ok(_) => (),
+                    Err(e) => panic!(
+                        "Tape fork child aborted.\n{}\n{}",
+                        e, self
+                    ),
+                },
+            )
+            .expect("Fork failed");
+
+            let parsed = parse_from(
+                forkfile.borrow_mut().as_mut().unwrap().as_file_mut(),
+            )
+            .expect("Failed to re-read tape forkfile");
+            let state = match parsed {
+                ParsedForkfile::Terminated(state) => break state,
+                ParsedForkfile::InProgress(state) => state,
+                ParsedForkfile::Corrupt => {
+                    panic!("Child process corrupted tape forkfile")
+                }
+            };
+
+            let curr = forkfile_size(&forkfile.borrow());
+            // The first child dying on its very first case, before
+            // completing any, is treated as "failed to start" (an
+            // Abort), matching the classic protocol: we cannot tell a
+            // broken harness from a first input that legitimately
+            // crashes, and re-forking would only crash identically. A
+            // real first-case failure (long_sleep_timeout) has passing
+            // cases before it, so cases_done > 0.
+            if curr == init_forkfile_size.get()
+                || (child_count >= 1
+                    && state.best_from_crash
+                    && state.statuses_recorded == 0)
+            {
+                // Either the child appended nothing, or across two
+                // children it never completed a single test without
+                // dying (e.g. value materialization itself times out).
+                // The classic protocol calls this "failed to start".
+                return Err(TestError::Abort(
+                    "Child process crashed or timed out before the first test \
+                     started running; giving up."
+                        .into(),
+                ));
+            }
+
+            // `state.best` already folds a dangling (crash) record; the
+            // next child re-anchors from it. Nothing to append here.
+            let _ = state;
+
+            child_count += 1;
+            if child_count >= 10000 {
+                return Err(TestError::Abort(
+                    "Giving up after 10000 child processes crashed".into(),
+                ));
+            }
+        };
+
+        // Reconstruct the shrunken value by replaying the winning tape
+        // (the children did the shrinking). No test is run here.
+        let best = match final_state.best {
+            None => return Ok(()),
+            Some(best) => best,
+        };
+        self.rng.set_seed(final_state.seed.clone());
+        self.rng.tape.start_replay(best.clone());
+        let tree = match strategy.new_tree(self) {
+            Ok(tree) => tree,
+            Err(msg) => {
+                self.rng.tape.finish_replay();
+                return Err(TestError::Abort(msg));
+            }
+        };
+        let (_output, _overrun) = self.rng.tape.finish_replay();
+        let value = tree.current();
+
+        let source_file = self.config.source_file;
+        if let Some(ref mut fp) = self.config.failure_persistence {
+            let bytes = tape::serialize_tape(&best);
+            fp.save_persisted_failure2(
+                source_file,
+                PersistedSeed(PersistedFailure::Tape {
+                    bytes,
+                    seed: Some(final_state.seed),
+                }),
+                &value,
+            );
+        }
+
+        let reason: Reason = if final_state.best_from_crash {
+            "Child process crashed or timed out on this input".into()
+        } else {
+            "Test failed".into()
+        };
+        Err(TestError::Fail(reason, value))
+    }
+
     fn run_in_process<S: Strategy>(
         &mut self,
         strategy: &S,
@@ -679,12 +927,13 @@ impl TestRunner {
                 PersistedFailure::Seed(persisted_seed) => {
                     // Replay seeds through the classic, tape-off
                     // generation path: seed entries are only written by
-                    // tape-off runs (fork/timeout, ValueTree engine, or
-                    // persistence impls that drop tapes), and tape-mode
-                    // generation consumes the RNG differently (e.g.
-                    // collection continuation flags), so recording here
-                    // would regenerate a different value than the one
-                    // that failed.
+                    // tape-off runs (the ValueTree engine, including its
+                    // fork/timeout runs, or persistence impls that drop
+                    // tapes; the tape engine under fork persists Tape
+                    // entries), and tape-mode generation consumes the RNG
+                    // differently (e.g. collection continuation flags),
+                    // so recording here would regenerate a different
+                    // value than the one that failed.
                     self.rng.set_seed(persisted_seed);
                     self.run_classic_case(
                         strategy,
@@ -2881,6 +3130,39 @@ mod test {
             .current();
         let _ = replay_runner.rng.tape.finish_replay();
         assert_eq!(100, value);
+    }
+
+    // L3: a hard crash (process::abort) on the failing input under
+    // fork+tape must still shrink to the minimal via the tape
+    // forkfile's crash recovery (each crashing attempt is a strictly
+    // smaller failing input that becomes the next best).
+    #[cfg(feature = "fork")]
+    #[test]
+    fn tape_fork_recovers_from_hard_crash() {
+        let mut runner = TestRunner::new(Config {
+            fork: true,
+            shrink_engine: ShrinkEngine::Tape,
+            test_name: Some(concat!(
+                module_path!(),
+                "::tape_fork_recovers_from_hard_crash"
+            )),
+            ..Config::default()
+        });
+
+        let failure = runner
+            .run(&(0i32..200), |v| {
+                if v >= 100 {
+                    ::std::process::abort();
+                }
+                Ok(())
+            })
+            .err()
+            .unwrap();
+
+        match failure {
+            TestError::Fail(_, value) => assert_eq!(100, value),
+            other => panic!("Unexpected result: {:?}", other),
+        }
     }
 
     #[test]
