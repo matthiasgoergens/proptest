@@ -110,7 +110,9 @@ impl fmt::Display for RngAlgorithm {
     }
 }
 
+use crate::std_facade::Rc;
 use crate::test_runner::tape::{Choice, TapeState};
+use core::cell::RefCell;
 
 /// Proptest's random number generator.
 #[derive(Clone, Debug)]
@@ -119,8 +121,11 @@ pub struct TestRng {
     /// Choice-tape state for the experimental tape shrink engine. `Off`
     /// (and thus zero-cost beyond a branch) unless the engine is active.
     /// Lives here rather than on `TestRunner` so that raw `RngCore` calls
-    /// and the runner's typed draws share one tape.
-    pub(crate) tape: TapeState,
+    /// and the runner's typed draws share one tape. Behind a shared
+    /// handle so that values which draw lazily (generated functions) can
+    /// keep reaching the tape from inside the test itself; see
+    /// `crate::func`.
+    pub(crate) tape: Rc<RefCell<TapeState>>,
 }
 
 #[derive(Clone, Debug)]
@@ -207,51 +212,54 @@ impl TryRng for TestRng {
     type Error = Infallible;
 
     fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
-        if self.tape.raw_active() {
-            if let Some(Choice::RawU32 { value }) =
-                self.tape.pop_replay(|c| matches!(c, Choice::RawU32 { .. }))
-            {
-                self.tape.record(Choice::RawU32 { value });
+        if self.tape.borrow().raw_active() {
+            let popped = self
+                .tape
+                .borrow_mut()
+                .pop_replay(|c| matches!(c, Choice::RawU32 { .. }));
+            if let Some(Choice::RawU32 { value }) = popped {
+                self.tape.borrow_mut().record(Choice::RawU32 { value });
                 return Ok(value);
             }
             let value = self.next_u32_inner();
-            self.tape.record(Choice::RawU32 { value });
+            self.tape.borrow_mut().record(Choice::RawU32 { value });
             return Ok(value);
         }
         Ok(self.next_u32_inner())
     }
 
     fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
-        if self.tape.raw_active() {
-            if let Some(Choice::RawU64 { value }) =
-                self.tape.pop_replay(|c| matches!(c, Choice::RawU64 { .. }))
-            {
-                self.tape.record(Choice::RawU64 { value });
+        if self.tape.borrow().raw_active() {
+            let popped = self
+                .tape
+                .borrow_mut()
+                .pop_replay(|c| matches!(c, Choice::RawU64 { .. }));
+            if let Some(Choice::RawU64 { value }) = popped {
+                self.tape.borrow_mut().record(Choice::RawU64 { value });
                 return Ok(value);
             }
             let value = self.next_u64_inner();
-            self.tape.record(Choice::RawU64 { value });
+            self.tape.borrow_mut().record(Choice::RawU64 { value });
             return Ok(value);
         }
         Ok(self.next_u64_inner())
     }
 
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
-        if self.tape.raw_active() {
-            if let Some(Choice::RawBytes { value }) =
-                self.tape.pop_replay(|c| {
-                    matches!(
-                        c,
-                        Choice::RawBytes { value } if value.len() == dest.len()
-                    )
-                })
-            {
+        if self.tape.borrow().raw_active() {
+            let popped = self.tape.borrow_mut().pop_replay(|c| {
+                matches!(
+                    c,
+                    Choice::RawBytes { value } if value.len() == dest.len()
+                )
+            });
+            if let Some(Choice::RawBytes { value }) = popped {
                 dest.copy_from_slice(&value);
-                self.tape.record(Choice::RawBytes { value });
+                self.tape.borrow_mut().record(Choice::RawBytes { value });
                 return Ok(());
             }
             self.fill_bytes_inner(dest);
-            self.tape.record(Choice::RawBytes {
+            self.tape.borrow_mut().record(Choice::RawBytes {
                 value: dest.to_vec(),
             });
             return Ok(());
@@ -508,7 +516,7 @@ impl TestRng {
                     }
                     RngAlgorithm::_NonExhaustive => unreachable!(),
                 },
-                tape: TapeState::default(),
+                tape: Rc::new(RefCell::new(TapeState::default())),
             }
         }
         #[cfg(all(
@@ -626,9 +634,15 @@ impl TestRng {
     /// Overwrite the given TestRng with the provided seed, preserving any
     /// active choice-tape state.
     pub(crate) fn set_seed(&mut self, seed: Seed) {
-        let tape = core::mem::take(&mut self.tape);
+        let tape = Rc::clone(&self.tape);
         *self = Self::from_seed_internal(seed);
         self.tape = tape;
+    }
+
+    /// A shared handle to the choice-tape state, for values that draw
+    /// lazily after generation (generated functions; see `crate::func`).
+    pub(crate) fn tape_handle(&self) -> Rc<RefCell<TapeState>> {
+        Rc::clone(&self.tape)
     }
 
     /// Generate a new randomized seed, set it to this TestRng,
@@ -647,7 +661,7 @@ impl TestRng {
         // derive RNGs (`prop_perturb`, `Just`-with-rng, ...) deterministic
         // under tape replay even though the inner RNG's state diverges
         // between recording and replay.
-        if self.tape.raw_active() {
+        if self.tape.borrow().raw_active() {
             match self.rng {
                 TestRngImpl::XorShift(..) => {
                     let mut seed = [0u8; 16];
@@ -744,7 +758,7 @@ impl TestRng {
                     record: Vec::new(),
                 },
             },
-            tape: TapeState::default(),
+            tape: Rc::new(RefCell::new(TapeState::default())),
         }
     }
 }
