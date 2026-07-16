@@ -127,16 +127,18 @@ draws.
 Hypothesis already ships shrinkable random functions and has since
 2019: `functions(..., pure=True)` draws the return value from the live
 ConjectureData at call time, memoised per argument, and refuses to be
-called outside the test. They never needed stream keys because their
-whole model is one linear choice sequence and their shrinker is
-misalignment-tolerant by construction; per-argument draws sit in the
-sequence in call order, so shrink edits that change call order or
-count scramble other arguments' draws, and the shrinker just powers
-through the noise. A Hypothesis port of stream keys would be a
-refinement (stabler fn shrinking, keyed persistence), not a new
-capability, and would have to swim against their deliberately simple
-linear-tape architecture. Not worth pursuing before the Rust port
-proves the keyed design twice.
+called outside the test. They never needed stream keys because
+positional identity gives them orphan adoption for free: a changed
+argument's call happens at the same point in the test and reads the
+same positions in the linear sequence, so the function keeps the old
+argument's behaviour, which is exactly what our adoption reconstructs.
+Measured 2026-07-16 (tapecheck design/hypothesis-comparison.md):
+Hypothesis is boundary-exact 20/20 on this file's whole test matrix,
+including the rare-cooperation case that stuck both our engines before
+adoption. Do not port stream keys there; the keyed design matters when
+draws outlive the engine's linear window, and its user-visible win
+over Hypothesis is the counterexample's function staying callable
+after the run (Hypothesis's is dead outside @given by design).
 
 ## Staging
 
