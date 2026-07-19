@@ -28,7 +28,7 @@
 //! The `Debug` form of a `RandomFn` prints the table of observed calls,
 //! which is exactly what a failure report needs.
 
-use crate::std_facade::{fmt, BTreeMap, Rc, String, Vec};
+use crate::std_facade::{fmt, BTreeMap, Rc, String};
 use core::cell::RefCell;
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
