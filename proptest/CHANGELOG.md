@@ -1,5 +1,17 @@
 ## Unreleased
 
+### New Features
+
+- The tape shrinker now tries both tape-realignment policies when a
+  shrink edit changes the shape of generation (so the recorded tape no
+  longer lines up with what the generator draws), keeping the simpler
+  still-failing result. `Config::shrink_realign` (env
+  `PROPTEST_SHRINK_REALIGN`) selects `both` (the default), `freeze`
+  (the historical behavior), or `consume`. It is free on proposals
+  that stay aligned, never worse than either fixed policy, and reaches
+  the canonical minimal example more often on `prop_flat_map`/union
+  generators (see `examples/realign-quality.rs`).
+
 ### Breaking Changes
 
 - The minimum supported Rust version has been increased to 1.86.0.
