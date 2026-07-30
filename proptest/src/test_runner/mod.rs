@@ -18,6 +18,8 @@ mod failure_persistence;
 mod reason;
 #[cfg(feature = "fork")]
 mod replay;
+#[cfg(feature = "fork")]
+mod tape_replay;
 mod result_cache;
 mod rng;
 mod runner;
