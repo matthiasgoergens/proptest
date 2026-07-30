@@ -68,6 +68,7 @@ pub mod bits;
 pub mod bool;
 pub mod char;
 pub mod collection;
+pub mod func;
 pub mod num;
 #[cfg(feature = "std")]
 pub mod range_subset;

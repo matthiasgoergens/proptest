@@ -17,7 +17,7 @@
 //! mode, accepting an edit iff the test still fails and the re-recorded
 //! output tape is shortlex-smaller than the incumbent.
 
-use crate::std_facade::Vec;
+use crate::std_facade::{BTreeMap, Vec};
 use core::cmp::Ordering;
 
 #[cfg(not(feature = "std"))]
@@ -240,38 +240,104 @@ pub(crate) struct Span {
     pub(crate) end: usize,
 }
 
-/// A recorded generation run.
+/// One element of a stream key (see `StreamKey`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum KeyElt {
+    /// The n-th sub-stream allocated under the parent this run
+    /// (a generated function's identity within its test case).
+    Split(u32),
+    /// A per-call salt (the hash of a generated function's argument).
+    Salt(u64),
+}
+
+/// Identity of a sub-stream (design: stream-keyed tapes, ported from
+/// tapecheck). The main generation stream is the empty key; a generated
+/// function's stream is `[Split(n)]`, and its per-argument streams are
+/// `[Split(n), Salt(hash)]`. Keys are deterministic across record and
+/// replay because splits happen at generation-driven points and salts
+/// are stable argument hashes.
+pub(crate) type StreamKey = Vec<KeyElt>;
+
+/// A recorded generation run: the main stream's choices and spans, plus
+/// keyed sub-streams (sorted by key) for split-off draws, i.e. what
+/// generated functions returned. Sub-streams have no spans: their
+/// deletable unit is the whole stream.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Tape {
     pub(crate) choices: Vec<Choice>,
     pub(crate) spans: Vec<Span>,
+    pub(crate) streams: Vec<(StreamKey, Vec<Choice>)>,
+}
+
+fn cmp_choices_shortlex(a: &[Choice], b: &[Choice]) -> Ordering {
+    a.len().cmp(&b.len()).then_with(|| {
+        for (a, b) in a.iter().zip(b) {
+            match a.cmp_complexity(b) {
+                Ordering::Equal => continue,
+                unequal => return unequal,
+            }
+        }
+        Ordering::Equal
+    })
 }
 
 impl Tape {
-    /// Shortlex comparison: fewer choices first, then elementwise by
-    /// complexity key. `Less` means `self` is simpler than `other`.
-    pub(crate) fn cmp_key(&self, other: &Tape) -> Ordering {
-        self.choices.len().cmp(&other.choices.len()).then_with(|| {
-            for (a, b) in self.choices.iter().zip(&other.choices) {
-                match a.cmp_complexity(b) {
-                    Ordering::Equal => continue,
-                    unequal => return unequal,
-                }
-            }
-            Ordering::Equal
-        })
+    /// Total number of choices across the main stream and all
+    /// sub-streams.
+    pub(crate) fn total_len(&self) -> usize {
+        self.choices.len()
+            + self
+                .streams
+                .iter()
+                .map(|(_, choices)| choices.len())
+                .sum::<usize>()
     }
 
-    /// The tape with every choice at its shrink target.
+    /// Shortlex comparison: fewer choices first (totalled across all
+    /// streams, so deleting a whole sub-stream is an improvement), then
+    /// the main stream elementwise by complexity key, then fewer
+    /// sub-streams, then the sorted sub-streams pairwise. `Less` means
+    /// `self` is simpler than `other`. A total order, so shrink
+    /// acceptance stays a strict descent.
+    pub(crate) fn cmp_key(&self, other: &Tape) -> Ordering {
+        self.total_len()
+            .cmp(&other.total_len())
+            .then_with(|| cmp_choices_shortlex(&self.choices, &other.choices))
+            .then_with(|| self.streams.len().cmp(&other.streams.len()))
+            .then_with(|| {
+                for ((ka, ca), (kb, cb)) in
+                    self.streams.iter().zip(&other.streams)
+                {
+                    match ka
+                        .cmp(kb)
+                        .then_with(|| cmp_choices_shortlex(ca, cb))
+                    {
+                        Ordering::Equal => continue,
+                        unequal => return unequal,
+                    }
+                }
+                Ordering::Equal
+            })
+    }
+
+    /// The tape with every choice, in every stream, at its shrink
+    /// target.
     pub(crate) fn trivial(&self) -> Tape {
         Tape {
             choices: self.choices.iter().map(Choice::trivial).collect(),
             spans: self.spans.clone(),
+            streams: self
+                .streams
+                .iter()
+                .map(|(k, choices)| {
+                    (k.clone(), choices.iter().map(Choice::trivial).collect())
+                })
+                .collect(),
         }
     }
 
-    /// A copy of the tape with the choice at `idx` replaced. Like
-    /// `with_span_deleted`, the copy's span list is dropped: replay
+    /// A copy of the tape with the main-stream choice at `idx` replaced.
+    /// Like `with_span_deleted`, the copy's span list is dropped: replay
     /// ignores input spans, and an accepted proposal re-records fresh
     /// ones on its output tape.
     pub(crate) fn with_choice(&self, idx: usize, choice: Choice) -> Tape {
@@ -280,12 +346,14 @@ impl Tape {
         Tape {
             choices,
             spans: Vec::new(),
+            streams: self.streams.clone(),
         }
     }
 
-    /// A copy of the tape with the choices of `span` removed. The copy's
-    /// span list is dropped (it would be stale); an accepted proposal gets
-    /// fresh spans from the replay's output tape anyway.
+    /// A copy of the tape with the choices of `span` removed from the
+    /// main stream. The copy's span list is dropped (it would be stale);
+    /// an accepted proposal gets fresh spans from the replay's output
+    /// tape anyway.
     pub(crate) fn with_span_deleted(&self, span: Span) -> Tape {
         let mut choices =
             Vec::with_capacity(self.choices.len() - (span.end - span.start));
@@ -294,44 +362,120 @@ impl Tape {
         Tape {
             choices,
             spans: Vec::new(),
+            streams: self.streams.clone(),
+        }
+    }
+
+    /// A copy of the tape with the choice at `idx` of sub-stream
+    /// `stream_idx` replaced.
+    pub(crate) fn with_stream_choice(
+        &self,
+        stream_idx: usize,
+        idx: usize,
+        choice: Choice,
+    ) -> Tape {
+        let mut streams = self.streams.clone();
+        streams[stream_idx].1[idx] = choice;
+        Tape {
+            choices: self.choices.clone(),
+            spans: Vec::new(),
+            streams,
+        }
+    }
+
+    /// A copy of the tape with sub-stream `stream_idx` removed entirely:
+    /// its draws resample fresh on replay (an absent stream is not an
+    /// overrun), which pushes generated functions toward constant
+    /// observed behaviour.
+    pub(crate) fn with_stream_deleted(&self, stream_idx: usize) -> Tape {
+        let mut streams = self.streams.clone();
+        streams.remove(stream_idx);
+        Tape {
+            choices: self.choices.clone(),
+            spans: Vec::new(),
+            streams,
+        }
+    }
+}
+
+/// Recording/replaying mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TapeMode {
+    Off,
+    Recording,
+    Replaying,
+}
+
+/// Per-stream runtime state. The write side has rewrite-over semantics:
+/// `wpos` rewinds to 0 at a call boundary (`enter_stream`), so a second
+/// same-argument call re-records over the same entries instead of
+/// appending duplicates; a divergent value truncates and overwrites.
+/// The read side is a per-stream replay cursor; `known` distinguishes a
+/// stream present in the replay input (exhausting it is an overrun)
+/// from a brand-new stream (all draws fresh, silently: new salts appear
+/// whenever an edit changes an argument's hash, and whole-stream
+/// deletion relies on absent streams sampling fresh).
+#[derive(Clone, Debug, Default)]
+struct StreamRt {
+    written: Vec<Choice>,
+    wpos: usize,
+    input: Vec<Choice>,
+    rpos: usize,
+    known: bool,
+    /// Set once this stream has been entered (or donated) during a
+    /// replay, so orphan adoption never reuses a donor.
+    claimed: bool,
+}
+
+impl StreamRt {
+    fn record(&mut self, choice: Choice) {
+        if self.wpos < self.written.len() && self.written[self.wpos] == choice
+        {
+            self.wpos += 1;
+        } else {
+            self.written.truncate(self.wpos);
+            self.written.push(choice);
+            self.wpos += 1;
         }
     }
 }
 
 /// Recording/replaying state, owned by `TestRng` so that both the typed
-/// draws on `TestRunner` and the raw `RngCore` calls write to the same tape.
-#[derive(Clone, Debug)]
-pub(crate) enum TapeMode {
-    Off,
-    Recording {
-        tape: Tape,
-    },
-    Replaying {
-        input: Tape,
-        cursor: usize,
-        output: Tape,
-        overrun: bool,
-    },
-}
-
+/// draws on `TestRunner` and the raw `RngCore` calls write to the same
+/// tape. Streams: all draws route to the current stream (the main
+/// stream by default); generated functions enter their per-argument
+/// stream around each call.
 #[derive(Clone, Debug)]
 pub(crate) struct TapeState {
     mode: TapeMode,
+    streams: BTreeMap<StreamKey, StreamRt>,
+    current: StreamKey,
+    overrun: bool,
     /// While positive, raw RngCore draws bypass the tape entirely. Typed
     /// draws set this while running their sample closures so the closure's
     /// raw entropy is subsumed by the single typed choice.
     suppress_raw: u32,
-    /// Start indices of currently-open spans (choice count at
-    /// `start_span` time).
+    /// Start indices of currently-open spans (main-stream choice count at
+    /// `start_span` time; `usize::MAX` when opened off the main stream,
+    /// where spans do not apply).
     span_stack: Vec<usize>,
+    /// Spans recorded on the main stream this run.
+    spans: Vec<Span>,
+    /// Sub-stream ordinal counters, per parent key, reset each run.
+    split_counters: BTreeMap<StreamKey, u32>,
 }
 
 impl Default for TapeState {
     fn default() -> Self {
         TapeState {
             mode: TapeMode::Off,
+            streams: BTreeMap::new(),
+            current: StreamKey::new(),
+            overrun: false,
             suppress_raw: 0,
             span_stack: Vec::new(),
+            spans: Vec::new(),
+            split_counters: BTreeMap::new(),
         }
     }
 }
@@ -342,7 +486,7 @@ impl TapeState {
     }
 
     pub(crate) fn is_replaying(&self) -> bool {
-        matches!(self.mode, TapeMode::Replaying { .. })
+        matches!(self.mode, TapeMode::Replaying)
     }
 
     /// Whether raw RngCore draws should currently be recorded/replayed.
@@ -359,61 +503,192 @@ impl TapeState {
         self.suppress_raw -= 1;
     }
 
-    pub(crate) fn start_recording(&mut self) {
-        self.mode = TapeMode::Recording {
-            tape: Tape::default(),
-        };
+    fn reset(&mut self) {
+        self.streams.clear();
+        self.current = StreamKey::new();
+        self.overrun = false;
         self.span_stack.clear();
+        self.spans.clear();
+        self.split_counters.clear();
+    }
+
+    pub(crate) fn start_recording(&mut self) {
+        self.reset();
+        self.mode = TapeMode::Recording;
+    }
+
+    pub(crate) fn start_replay(&mut self, input: Tape) {
+        self.reset();
+        self.mode = TapeMode::Replaying;
+        let root = StreamRt {
+            input: input.choices,
+            known: true,
+            ..StreamRt::default()
+        };
+        self.streams.insert(StreamKey::new(), root);
+        for (key, choices) in input.streams {
+            self.streams.insert(
+                key,
+                StreamRt {
+                    input: choices,
+                    known: true,
+                    ..StreamRt::default()
+                },
+            );
+        }
+    }
+
+    /// Collect the run's output tape: the main stream's writes and spans
+    /// plus every sub-stream that was actually written (streams the run
+    /// never touched are dropped, which garbage-collects orphans).
+    fn collect(&mut self) -> Tape {
+        let mut main = Vec::new();
+        let mut streams = Vec::new();
+        for (key, rt) in core::mem::take(&mut self.streams) {
+            if key.is_empty() {
+                main = rt.written;
+            } else if !rt.written.is_empty() {
+                streams.push((key, rt.written));
+            }
+        }
+        // BTreeMap iteration is already key-sorted.
+        let spans = core::mem::take(&mut self.spans);
+        Tape {
+            choices: main,
+            spans,
+            streams,
+        }
     }
 
     /// Stop recording and return the recorded tape. Returns an empty tape
     /// if not recording.
     pub(crate) fn take_recording(&mut self) -> Tape {
-        self.span_stack.clear();
-        match core::mem::replace(&mut self.mode, TapeMode::Off) {
-            TapeMode::Recording { tape } => tape,
-            _ => Tape::default(),
+        let was_recording = matches!(self.mode, TapeMode::Recording);
+        self.mode = TapeMode::Off;
+        let tape = self.collect();
+        self.reset();
+        if was_recording {
+            tape
+        } else {
+            Tape::default()
         }
-    }
-
-    pub(crate) fn start_replay(&mut self, input: Tape) {
-        self.mode = TapeMode::Replaying {
-            input,
-            cursor: 0,
-            output: Tape::default(),
-            overrun: false,
-        };
-        self.span_stack.clear();
     }
 
     /// Stop replaying and return the re-recorded output tape plus whether
     /// the input was overrun. Returns an empty tape if not replaying.
     pub(crate) fn finish_replay(&mut self) -> (Tape, bool) {
-        self.span_stack.clear();
-        match core::mem::replace(&mut self.mode, TapeMode::Off) {
-            TapeMode::Replaying {
-                output, overrun, ..
-            } => (output, overrun),
-            _ => (Tape::default(), false),
+        let was_replaying = matches!(self.mode, TapeMode::Replaying);
+        let overrun = self.overrun;
+        self.mode = TapeMode::Off;
+        let tape = self.collect();
+        self.reset();
+        if was_replaying {
+            (tape, overrun)
+        } else {
+            (Tape::default(), false)
         }
     }
 
-    /// The tape currently being written: the recording, or the output
-    /// re-recording during replay.
-    fn active_tape_mut(&mut self) -> Option<&mut Tape> {
-        match &mut self.mode {
-            TapeMode::Off => None,
-            TapeMode::Recording { tape } => Some(tape),
-            TapeMode::Replaying { output, .. } => Some(output),
-        }
+    /// Whether the replay input has already been overrun. Lets the
+    /// engine reject a proposal before running the test.
+    pub(crate) fn overrun_now(&self) -> bool {
+        self.overrun
     }
 
-    /// Open a span at the current position of the active tape. No-op when
-    /// the tape is off.
+    fn current_rt(&mut self) -> &mut StreamRt {
+        // Entry API needs an owned key; avoid the clone on the hot path
+        // (the current stream almost always exists already).
+        if !self.streams.contains_key(&self.current) {
+            self.streams
+                .insert(self.current.clone(), StreamRt::default());
+        }
+        self.streams.get_mut(&self.current).expect("just inserted")
+    }
+
+    /// Switch all draws to `key`'s stream, rewinding that stream's read
+    /// and write cursors (a call boundary: same-argument calls replay
+    /// identically). Returns the previous stream for `exit_stream`.
+    ///
+    /// Orphan adoption: when a replay enters an UNKNOWN salted stream
+    /// (a generated function called with an argument the input tape
+    /// never saw, typically because a shrink edit changed the argument
+    /// and with it the salt), the stream adopts the input of an
+    /// unclaimed sibling (same parent, salt leaf, key order). That
+    /// sibling is exactly the orphan whose argument just changed, so
+    /// the function keeps its observed behaviour across the edit
+    /// instead of flipping a fresh coin; the accepted output re-records
+    /// under the new salt, realigning the tape for the next round.
+    pub(crate) fn enter_stream(&mut self, key: StreamKey) -> StreamKey {
+        if !self.streams.contains_key(&key) {
+            self.streams.insert(key.clone(), StreamRt::default());
+        }
+        let known = self.streams[&key].known;
+        if self.is_replaying()
+            && !known
+            && matches!(key.last(), Some(KeyElt::Salt(_)))
+        {
+            let parent = &key[..key.len() - 1];
+            let donor_key = self
+                .streams
+                .iter()
+                .find(|(k, rt)| {
+                    rt.known
+                        && !rt.claimed
+                        && k.len() == key.len()
+                        && k.starts_with(parent)
+                        && matches!(k.last(), Some(KeyElt::Salt(_)))
+                })
+                .map(|(k, _)| k.clone());
+            if let Some(donor_key) = donor_key {
+                let donated = {
+                    let donor =
+                        self.streams.get_mut(&donor_key).expect("found");
+                    donor.claimed = true;
+                    donor.input.clone()
+                };
+                let rt = self.streams.get_mut(&key).expect("inserted");
+                rt.input = donated;
+                rt.known = true;
+            }
+        }
+        let rt = self.streams.get_mut(&key).expect("just inserted");
+        rt.rpos = 0;
+        rt.wpos = 0;
+        rt.claimed = true;
+        core::mem::replace(&mut self.current, key)
+    }
+
+    /// Restore the stream returned by `enter_stream`.
+    pub(crate) fn exit_stream(&mut self, prev: StreamKey) {
+        self.current = prev;
+    }
+
+    /// Allocate the next sub-stream key under the current stream. The
+    /// per-parent ordinal makes keys deterministic across record and
+    /// replay: splits happen at generation-driven points.
+    pub(crate) fn alloc_split(&mut self) -> StreamKey {
+        let n = self
+            .split_counters
+            .entry(self.current.clone())
+            .or_insert(0);
+        let ordinal = *n;
+        *n += 1;
+        let mut key = self.current.clone();
+        key.push(KeyElt::Split(ordinal));
+        key
+    }
+
+    /// Open a span at the current position of the main stream. No-op
+    /// when the tape is off; spans opened while a sub-stream is current
+    /// are ignored (a sub-stream's deletable unit is the whole stream).
     pub(crate) fn start_span(&mut self) {
-        let pos = match self.active_tape_mut() {
-            Some(tape) => tape.choices.len(),
-            None => return,
+        if !self.is_on() {
+            return;
+        }
+        let pos = if self.current.is_empty() {
+            self.current_rt().written.len()
+        } else {
+            usize::MAX
         };
         self.span_stack.push(pos);
     }
@@ -426,22 +701,23 @@ impl TapeState {
             Some(start) => start,
             None => return,
         };
-        if let Some(tape) = self.active_tape_mut() {
-            let end = tape.choices.len();
-            if end > start {
-                tape.spans.push(Span { start, end });
-            }
+        if start == usize::MAX || !self.is_on() || !self.current.is_empty() {
+            return;
+        }
+        let end = self.current_rt().written.len();
+        if end > start {
+            self.spans.push(Span { start, end });
         }
     }
 
-    /// Append the choice actually used to the active tape (the recording,
-    /// or the output re-recording during replay). No-op when off.
+    /// Append the choice actually used to the current stream (the
+    /// recording, or the output re-recording during replay). No-op when
+    /// off.
     pub(crate) fn record(&mut self, choice: Choice) {
-        match &mut self.mode {
-            TapeMode::Off => (),
-            TapeMode::Recording { tape } => tape.choices.push(choice),
-            TapeMode::Replaying { output, .. } => output.choices.push(choice),
+        if !self.is_on() {
+            return;
         }
+        self.current_rt().record(choice);
     }
 
     /// Record a choice whose value is forced by generation structure
@@ -454,11 +730,13 @@ impl TapeState {
         if !self.is_on() {
             return;
         }
-        if let TapeMode::Replaying { input, cursor, .. } = &mut self.mode {
-            if *cursor < input.choices.len()
-                && matches!(input.choices[*cursor], Choice::Bool { .. })
+        if self.is_replaying() {
+            let rt = self.current_rt();
+            if rt.known
+                && rt.rpos < rt.input.len()
+                && matches!(rt.input[rt.rpos], Choice::Bool { .. })
             {
-                *cursor += 1;
+                rt.rpos += 1;
             }
         }
         self.record(Choice::Bool { value });
@@ -490,30 +768,30 @@ impl TapeState {
         forced
     }
 
-    /// During replay, consume and return the next input choice if `matcher`
-    /// accepts it. Returns `None` (and samples must go fresh) on kind
-    /// mismatch, on overrun (also setting the overrun flag), or when not
-    /// replaying.
+    /// During replay, consume and return the current stream's next input
+    /// choice if `matcher` accepts it. Returns `None` (and samples must
+    /// go fresh) on kind mismatch, on overrun of a known stream (also
+    /// setting the overrun flag), on an unknown stream (fresh by
+    /// design), or when not replaying.
     pub(crate) fn pop_replay(
         &mut self,
         matcher: impl FnOnce(&Choice) -> bool,
     ) -> Option<Choice> {
-        if let TapeMode::Replaying {
-            input,
-            cursor,
-            overrun,
-            ..
-        } = &mut self.mode
-        {
-            if *cursor >= input.choices.len() {
-                *overrun = true;
-                return None;
-            }
-            if matcher(&input.choices[*cursor]) {
-                let choice = input.choices[*cursor].clone();
-                *cursor += 1;
-                return Some(choice);
-            }
+        if !self.is_replaying() {
+            return None;
+        }
+        let rt = self.current_rt();
+        if !rt.known {
+            return None;
+        }
+        if rt.rpos >= rt.input.len() {
+            self.overrun = true;
+            return None;
+        }
+        if matcher(&rt.input[rt.rpos]) {
+            let choice = rt.input[rt.rpos].clone();
+            rt.rpos += 1;
+            return Some(choice);
         }
         None
     }
@@ -522,10 +800,50 @@ impl TapeState {
 /// Serialize a tape for failure persistence (the payload of the "ct1"
 /// persisted-failure format). Spans are shrinking metadata and are not
 /// persisted; replay ignores them.
+///
+/// A tape without sub-streams serializes as the original flat record
+/// list (choice tags 0..=5), so pre-stream files keep loading and
+/// stream-free tapes keep writing the historical bytes. A tape with
+/// sub-streams gets a leading `6` tag (no flat record starts with 6),
+/// then a counted main section and counted keyed stream sections.
 pub(crate) fn serialize_tape(tape: &Tape) -> Vec<u8> {
     let mut out = Vec::new();
+    if !tape.streams.is_empty() {
+        out.push(6);
+        out.extend_from_slice(&(tape.choices.len() as u32).to_le_bytes());
+        for choice in &tape.choices {
+            serialize_choice(choice, &mut out);
+        }
+        out.extend_from_slice(&(tape.streams.len() as u32).to_le_bytes());
+        for (key, choices) in &tape.streams {
+            out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            for elt in key {
+                match elt {
+                    KeyElt::Split(n) => {
+                        out.push(0);
+                        out.extend_from_slice(&n.to_le_bytes());
+                    }
+                    KeyElt::Salt(s) => {
+                        out.push(1);
+                        out.extend_from_slice(&s.to_le_bytes());
+                    }
+                }
+            }
+            out.extend_from_slice(&(choices.len() as u32).to_le_bytes());
+            for choice in choices {
+                serialize_choice(choice, &mut out);
+            }
+        }
+        return out;
+    }
     for choice in &tape.choices {
-        match choice {
+        serialize_choice(choice, &mut out);
+    }
+    out
+}
+
+fn serialize_choice(choice: &Choice, out: &mut Vec<u8>) {
+    match choice {
             Choice::Integer {
                 value,
                 min,
@@ -567,22 +885,83 @@ pub(crate) fn serialize_tape(tape: &Tape) -> Vec<u8> {
                 out.extend_from_slice(&(value.len() as u32).to_le_bytes());
                 out.extend_from_slice(value);
             }
-        }
     }
-    out
+}
+
+fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+    if bytes.len() < n {
+        return None;
+    }
+    let (head, tail) = bytes.split_at(n);
+    *bytes = tail;
+    Some(head)
+}
+
+fn take_u32(bytes: &mut &[u8]) -> Option<u32> {
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(take(bytes, 4)?);
+    Some(u32::from_le_bytes(buf))
+}
+
+fn take_u64(bytes: &mut &[u8]) -> Option<u64> {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(take(bytes, 8)?);
+    Some(u64::from_le_bytes(buf))
 }
 
 /// Inverse of `serialize_tape`. Strict: any malformed input yields `None`
 /// (the persistence layer then ignores the entry).
 pub(crate) fn deserialize_tape(bytes: &[u8]) -> Option<Tape> {
-    fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
-        if bytes.len() < n {
+    let mut bytes = bytes;
+    if bytes.first() == Some(&6) {
+        // v2: counted sections with keyed sub-streams.
+        take(&mut bytes, 1)?;
+        let n_main = take_u32(&mut bytes)? as usize;
+        let mut choices = Vec::new();
+        for _ in 0..n_main {
+            choices.push(deserialize_choice(&mut bytes)?);
+        }
+        let n_streams = take_u32(&mut bytes)? as usize;
+        let mut streams = Vec::new();
+        for _ in 0..n_streams {
+            let n_key = take_u32(&mut bytes)? as usize;
+            let mut key = StreamKey::new();
+            for _ in 0..n_key {
+                let tag = take(&mut bytes, 1)?[0];
+                key.push(match tag {
+                    0 => KeyElt::Split(take_u32(&mut bytes)?),
+                    1 => KeyElt::Salt(take_u64(&mut bytes)?),
+                    _ => return None,
+                });
+            }
+            let n_choices = take_u32(&mut bytes)? as usize;
+            let mut stream = Vec::new();
+            for _ in 0..n_choices {
+                stream.push(deserialize_choice(&mut bytes)?);
+            }
+            streams.push((key, stream));
+        }
+        if !bytes.is_empty() {
             return None;
         }
-        let (head, tail) = bytes.split_at(n);
-        *bytes = tail;
-        Some(head)
+        return Some(Tape {
+            choices,
+            spans: Vec::new(),
+            streams,
+        });
     }
+    let mut choices = Vec::new();
+    while !bytes.is_empty() {
+        choices.push(deserialize_choice(&mut bytes)?);
+    }
+    Some(Tape {
+        choices,
+        spans: Vec::new(),
+        streams: Vec::new(),
+    })
+}
+
+fn deserialize_choice(bytes: &mut &[u8]) -> Option<Choice> {
     fn take_u128(bytes: &mut &[u8]) -> Option<u128> {
         let mut buf = [0u8; 16];
         buf.copy_from_slice(take(bytes, 16)?);
@@ -594,54 +973,36 @@ pub(crate) fn deserialize_tape(bytes: &[u8]) -> Option<Tape> {
         Some(f64::from_le_bytes(buf))
     }
 
-    let mut bytes = bytes;
-    let mut choices = Vec::new();
-    while !bytes.is_empty() {
-        let tag = take(&mut bytes, 1)?[0];
-        choices.push(match tag {
-            0 => Choice::Integer {
-                value: take_u128(&mut bytes)?,
-                min: take_u128(&mut bytes)?,
-                max: take_u128(&mut bytes)?,
-                shrink_to: take_u128(&mut bytes)?,
-            },
-            1 => Choice::Float {
-                value: take_f64(&mut bytes)?,
-                min: take_f64(&mut bytes)?,
-                max: take_f64(&mut bytes)?,
-                allow_nan: 0 != take(&mut bytes, 1)?[0],
-            },
-            2 => Choice::Bool {
-                value: 0 != take(&mut bytes, 1)?[0],
-            },
-            3 => {
-                let mut buf = [0u8; 4];
-                buf.copy_from_slice(take(&mut bytes, 4)?);
-                Choice::RawU32 {
-                    value: u32::from_le_bytes(buf),
-                }
+    let tag = take(bytes, 1)?[0];
+    Some(match tag {
+        0 => Choice::Integer {
+            value: take_u128(bytes)?,
+            min: take_u128(bytes)?,
+            max: take_u128(bytes)?,
+            shrink_to: take_u128(bytes)?,
+        },
+        1 => Choice::Float {
+            value: take_f64(bytes)?,
+            min: take_f64(bytes)?,
+            max: take_f64(bytes)?,
+            allow_nan: 0 != take(bytes, 1)?[0],
+        },
+        2 => Choice::Bool {
+            value: 0 != take(bytes, 1)?[0],
+        },
+        3 => Choice::RawU32 {
+            value: take_u32(bytes)?,
+        },
+        4 => Choice::RawU64 {
+            value: take_u64(bytes)?,
+        },
+        5 => {
+            let len = take_u32(bytes)? as usize;
+            Choice::RawBytes {
+                value: take(bytes, len)?.to_vec(),
             }
-            4 => {
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(take(&mut bytes, 8)?);
-                Choice::RawU64 {
-                    value: u64::from_le_bytes(buf),
-                }
-            }
-            5 => {
-                let mut buf = [0u8; 4];
-                buf.copy_from_slice(take(&mut bytes, 4)?);
-                let len = u32::from_le_bytes(buf) as usize;
-                Choice::RawBytes {
-                    value: take(&mut bytes, len)?.to_vec(),
-                }
-            }
-            _ => return None,
-        });
-    }
-    Some(Tape {
-        choices,
-        spans: Vec::new(),
+        }
+        _ => return None,
     })
 }
 
@@ -713,7 +1074,50 @@ mod test {
         Tape {
             choices,
             spans: Vec::new(),
+            streams: Vec::new(),
         }
+    }
+
+    #[test]
+    fn serialize_v2_roundtrip_and_v1_compat() {
+        // Stream-free tapes keep the historical flat format.
+        let flat = tape_of(vec![
+            Choice::Integer {
+                value: 5,
+                min: 0,
+                max: 10,
+                shrink_to: 0,
+            },
+            Choice::Bool { value: true },
+        ]);
+        let bytes = serialize_tape(&flat);
+        assert_eq!(0, bytes[0], "v1 bytes start with the first record tag");
+        assert_eq!(Some(flat.clone()), deserialize_tape(&bytes));
+
+        // Stream-carrying tapes round-trip through the v2 format.
+        let mut with_streams = flat.clone();
+        with_streams.streams = vec![
+            (
+                vec![KeyElt::Split(0), KeyElt::Salt(0xdead_beef_dead_beef)],
+                vec![Choice::RawU32 { value: 7 }],
+            ),
+            (
+                vec![KeyElt::Split(1)],
+                vec![Choice::Bool { value: false }],
+            ),
+        ];
+        let bytes = serialize_tape(&with_streams);
+        assert_eq!(6, bytes[0], "v2 bytes start with the version tag");
+        assert_eq!(Some(with_streams), deserialize_tape(&bytes));
+    }
+
+    #[test]
+    fn stream_deletion_orders_smaller() {
+        let mut a = tape_of(vec![Choice::Bool { value: false }]);
+        a.streams =
+            vec![(vec![KeyElt::Split(0)], vec![Choice::Bool { value: true }])];
+        let b = a.with_stream_deleted(0);
+        assert_eq!(Ordering::Less, b.cmp_key(&a));
     }
 
     #[test]

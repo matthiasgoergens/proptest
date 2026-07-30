@@ -39,7 +39,8 @@ use crate::test_runner::reason::*;
 use crate::test_runner::replay;
 use crate::test_runner::result_cache::*;
 use crate::test_runner::rng::TestRng;
-use crate::test_runner::tape::{self, Choice, Tape, TapeInt};
+use crate::std_facade::Rc;
+use crate::test_runner::tape::{self, Choice, Tape, TapeInt, TapeState};
 
 #[cfg(feature = "fork")]
 const ENV_FORK_FILE: &'static str = "_PROPTEST_FORKFILE";
@@ -1239,19 +1240,20 @@ impl TestRunner {
     where
         T: TapeInt,
     {
-        if !self.rng.tape.is_on() {
+        if !self.rng.tape.borrow().is_on() {
             return sample(self);
         }
         let emin = T::encode(min);
         let emax = T::encode(max);
-        if self.rng.tape.is_replaying() {
-            if let Some(Choice::Integer { value, .. }) = self
+        if self.rng.tape.borrow().is_replaying() {
+            let popped = self
                 .rng
                 .tape
-                .pop_replay(|c| matches!(c, Choice::Integer { .. }))
-            {
+                .borrow_mut()
+                .pop_replay(|c| matches!(c, Choice::Integer { .. }));
+            if let Some(Choice::Integer { value, .. }) = popped {
                 let value = conform(T::decode(value.clamp(emin, emax)));
-                self.rng.tape.record(Choice::Integer {
+                self.rng.tape.borrow_mut().record(Choice::Integer {
                     value: T::encode(value),
                     min: emin,
                     max: emax,
@@ -1261,10 +1263,10 @@ impl TestRunner {
             }
         }
         // Recording, or drawing fresh after a replay misalignment.
-        self.rng.tape.suppress_raw();
+        self.rng.tape.borrow_mut().suppress_raw();
         let sampled = sample(self);
-        self.rng.tape.unsuppress_raw();
-        self.rng.tape.record(Choice::Integer {
+        self.rng.tape.borrow_mut().unsuppress_raw();
+        self.rng.tape.borrow_mut().record(Choice::Integer {
             value: T::encode(sampled),
             min: emin,
             max: emax,
@@ -1305,18 +1307,19 @@ impl TestRunner {
         conform: impl Fn(f64) -> f64,
         sample: impl FnOnce(&mut Self) -> f64,
     ) -> f64 {
-        if !self.rng.tape.is_on() {
+        if !self.rng.tape.borrow().is_on() {
             return match self.maybe_weird_float(min, max, allow_nan, &conform) {
                 Some(weird) => weird,
                 None => sample(self),
             };
         }
-        if self.rng.tape.is_replaying() {
-            if let Some(Choice::Float { value, .. }) = self
+        if self.rng.tape.borrow().is_replaying() {
+            let popped = self
                 .rng
                 .tape
-                .pop_replay(|c| matches!(c, Choice::Float { .. }))
-            {
+                .borrow_mut()
+                .pop_replay(|c| matches!(c, Choice::Float { .. }));
+            if let Some(Choice::Float { value, .. }) = popped {
                 let value = if value.is_nan() {
                     if allow_nan {
                         value
@@ -1327,7 +1330,7 @@ impl TestRunner {
                     value.clamp(min, max)
                 };
                 let value = conform(value);
-                self.rng.tape.record(Choice::Float {
+                self.rng.tape.borrow_mut().record(Choice::Float {
                     value,
                     min,
                     max,
@@ -1336,14 +1339,14 @@ impl TestRunner {
                 return value;
             }
         }
-        self.rng.tape.suppress_raw();
+        self.rng.tape.borrow_mut().suppress_raw();
         let sampled =
             match self.maybe_weird_float(min, max, allow_nan, &conform) {
                 Some(weird) => weird,
                 None => sample(self),
             };
-        self.rng.tape.unsuppress_raw();
-        self.rng.tape.record(Choice::Float {
+        self.rng.tape.borrow_mut().unsuppress_raw();
+        self.rng.tape.borrow_mut().record(Choice::Float {
             value: sampled,
             min,
             max,
@@ -1403,21 +1406,22 @@ impl TestRunner {
     /// "stop"/"simpler" as `false` (e.g. collection continuation flags
     /// are `true = one more element`).
     pub fn draw_bool(&mut self, probability_true: f64) -> bool {
-        if !self.rng.tape.is_on() {
+        if !self.rng.tape.borrow().is_on() {
             return self.rng.random_bool(probability_true);
         }
-        if let Some(Choice::Bool { value }) = self
+        let popped = self
             .rng
             .tape
-            .pop_replay(|c| matches!(c, Choice::Bool { .. }))
-        {
-            self.rng.tape.record(Choice::Bool { value });
+            .borrow_mut()
+            .pop_replay(|c| matches!(c, Choice::Bool { .. }));
+        if let Some(Choice::Bool { value }) = popped {
+            self.rng.tape.borrow_mut().record(Choice::Bool { value });
             return value;
         }
-        self.rng.tape.suppress_raw();
+        self.rng.tape.borrow_mut().suppress_raw();
         let sampled = self.rng.random_bool(probability_true);
-        self.rng.tape.unsuppress_raw();
-        self.rng.tape.record(Choice::Bool { value: sampled });
+        self.rng.tape.borrow_mut().unsuppress_raw();
+        self.rng.tape.borrow_mut().record(Choice::Bool { value: sampled });
         sampled
     }
 
@@ -1425,31 +1429,31 @@ impl TestRunner {
     /// replaying). Strategies use this to select tape-friendly encodings
     /// (e.g. continuation flags instead of an up-front collection size).
     pub fn tape_is_on(&self) -> bool {
-        self.rng.tape.is_on()
+        self.rng.tape.borrow().is_on()
     }
 
     /// Record a structurally-forced boolean on the choice tape without
     /// drawing entropy. See `TapeState::record_forced_bool`.
     pub fn record_forced_bool(&mut self, value: bool) {
-        self.rng.tape.record_forced_bool(value);
+        self.rng.tape.borrow_mut().record_forced_bool(value);
     }
 
     /// Open a span (a deletable logical unit) on the choice tape. No-op
     /// when the tape is off. Always pair with `end_span`.
     pub fn start_span(&mut self) {
-        self.rng.tape.start_span();
+        self.rng.tape.borrow_mut().start_span();
     }
 
     /// Close the innermost open span.
     pub fn end_span(&mut self) {
-        self.rng.tape.end_span();
+        self.rng.tape.borrow_mut().end_span();
     }
 
     /// Record a boolean that generation forces to `forced` without
     /// drawing entropy, but that the tape shrinker may edit (the
     /// replayed value is honored). See `TapeState::draw_bool_forced`.
     pub fn draw_bool_forced(&mut self, forced: bool) -> bool {
-        self.rng.tape.draw_bool_forced(forced)
+        self.rng.tape.borrow_mut().draw_bool_forced(forced)
     }
 
     /// Drive the tape encoding of a variable-length sequence of
@@ -1519,16 +1523,18 @@ impl TestRunner {
         // to the exact pre-generation state; fresh draws after a replay
         // misalignment are then at least reproducible.
         let rng_snapshot = self.rng.clone();
-        self.rng.tape.start_recording();
+        self.rng.tape.borrow_mut().start_recording();
         let case = match strategy.new_tree(self) {
             Ok(case) => case,
             Err(msg) => {
-                self.rng.tape.take_recording();
+                self.rng.tape.borrow_mut().take_recording();
                 return Err(TestError::Abort(msg));
             }
         };
-        let recorded = self.rng.tape.take_recording();
 
+        // The recording stays live through the test: generated functions
+        // (crate::func) draw when the test calls them, and those draws
+        // belong on the tape as keyed sub-streams.
         let result = call_test(
             self,
             case.current(),
@@ -1538,6 +1544,7 @@ impl TestRunner {
             fork_output,
             is_from_persisted_seed,
         );
+        let recorded = self.rng.tape.borrow_mut().take_recording();
 
         let ok_type = match result {
             Ok(success) => success,
@@ -1636,6 +1643,20 @@ impl TestRunner {
                 break;
             }
 
+            let (imp, ex) = self.tape_delete_streams(
+                strategy,
+                test,
+                &rng_snapshot,
+                &mut best,
+                &mut budget,
+                result_cache,
+                fork_output,
+            );
+            improved |= imp;
+            if ex {
+                break;
+            }
+
             let (imp, ex) = self.tape_lower_and_delete(
                 strategy,
                 test,
@@ -1682,6 +1703,7 @@ impl TestRunner {
             while idx < best.tape.choices.len() {
                 let (imp, ex) = self.tape_minimize_choice(
                     idx,
+                    None,
                     strategy,
                     test,
                     &rng_snapshot,
@@ -1696,6 +1718,35 @@ impl TestRunner {
                     break;
                 }
                 idx += 1;
+            }
+
+            // Minimize sub-stream choices too: this is what shrinks the
+            // observed behaviour of generated functions.
+            let mut si = 0;
+            while !exhausted && si < best.tape.streams.len() {
+                let mut idx = 0;
+                while si < best.tape.streams.len()
+                    && idx < best.tape.streams[si].1.len()
+                {
+                    let (imp, ex) = self.tape_minimize_choice(
+                        idx,
+                        Some(si),
+                        strategy,
+                        test,
+                        &rng_snapshot,
+                        &mut best,
+                        &mut budget,
+                        result_cache,
+                        fork_output,
+                    );
+                    improved |= imp;
+                    if ex {
+                        exhausted = true;
+                        break;
+                    }
+                    idx += 1;
+                }
+                si += 1;
             }
             if !improved {
                 break;
@@ -1714,7 +1765,24 @@ impl TestRunner {
         }
 
         self.rng = rng_snapshot;
-        (best.why, best.tree.current())
+
+        // Regenerate the reported value from the winning tape on a replay
+        // that is deliberately left live: a counterexample containing
+        // generated functions keeps its observed behaviour only while its
+        // tape answers (a finished tape falls back to fresh randomness on
+        // exactly the calls the report is about). The runner then detaches
+        // onto a fresh tape handle so later cases start clean; the value
+        // keeps the live one.
+        self.rng.tape.borrow_mut().start_replay(best.tape.clone());
+        let local_rejects_before = self.local_rejects;
+        let live = strategy.new_tree(self);
+        self.local_rejects = local_rejects_before;
+        self.rng.tape =
+            Rc::new(core::cell::RefCell::new(TapeState::default()));
+        match live {
+            Ok(tree) => (best.why, tree.current()),
+            Err(_) => (best.why, best.tree.current()),
+        }
     }
 
     /// Replay a persisted choice tape: regenerate a value from it, run
@@ -1735,11 +1803,11 @@ impl TestRunner {
         fork_output: &mut ForkOutput,
     ) -> Result<Result<(), String>, TestError<S::Value>> {
         let rng_snapshot = self.rng.clone();
-        self.rng.tape.start_replay(input);
+        self.rng.tape.borrow_mut().start_replay(input);
         let case = match strategy.new_tree(self) {
             Ok(case) => case,
             Err(reason) => {
-                self.rng.tape.finish_replay();
+                self.rng.tape.borrow_mut().finish_replay();
                 self.rng = rng_snapshot;
                 return Ok(Err(format!(
                     "a persisted choice tape (ct1 entry) no longer \
@@ -1748,12 +1816,19 @@ impl TestRunner {
                 )));
             }
         };
-        let (output, _overrun) = self.rng.tape.finish_replay();
+        if !(ShrinkEngine::Tape == self.config.shrink_engine
+            && !self.config.fork()
+            && !fork_output.is_in_fork())
+        {
+            self.rng.tape.borrow_mut().finish_replay();
+        }
 
         if ShrinkEngine::Tape == self.config.shrink_engine
             && !self.config.fork()
             && !fork_output.is_in_fork()
         {
+            // Live through the test, so persisted failures that involve
+            // generated functions reproduce.
             let result = call_test(
                 self,
                 case.current(),
@@ -1763,6 +1838,8 @@ impl TestRunner {
                 fork_output,
                 true,
             );
+            let (output, _overrun) =
+                self.rng.tape.borrow_mut().finish_replay();
             match result {
                 Ok(_) => {
                     self.rng = rng_snapshot;
@@ -1822,7 +1899,7 @@ impl TestRunner {
         }
 
         self.rng = rng_snapshot.clone();
-        self.rng.tape.start_replay(proposal);
+        self.rng.tape.borrow_mut().start_replay(proposal);
         // Local rejects incurred while re-vetting a shrink proposal (e.g.
         // a filter refusing edited values) must not drain the run-wide
         // budget: the classic shrinker never consumes it while shrinking,
@@ -1832,20 +1909,26 @@ impl TestRunner {
         let local_rejects_before = self.local_rejects;
         let tree = strategy.new_tree(self);
         self.local_rejects = local_rejects_before;
-        let (output, overrun) = self.rng.tape.finish_replay();
         let tree = match tree {
             Ok(tree) => tree,
             // Generation rejected the replayed values (e.g. a filter's
             // retry budget ran out); discard the attempt.
-            Err(_) => return TapeAttemptResult::Rejected,
+            Err(_) => {
+                self.rng.tape.borrow_mut().finish_replay();
+                return TapeAttemptResult::Rejected;
+            }
         };
-        if overrun {
-            return TapeAttemptResult::Rejected;
-        }
-        if Ordering::Less != output.cmp_key(&best.tape) {
+        if self.rng.tape.borrow().overrun_now() {
+            // Generation already overran the proposal (it truncated);
+            // not worth running the test.
+            self.rng.tape.borrow_mut().finish_replay();
             return TapeAttemptResult::Rejected;
         }
 
+        // The replay stays live through the test so generated functions
+        // draw from (and re-record onto) the proposal's sub-streams; the
+        // output tape is complete only after the test ran, which is also
+        // why the shortlex check moved below the test.
         let result = call_test(
             self,
             tree.current(),
@@ -1855,18 +1938,63 @@ impl TestRunner {
             fork_output,
             false,
         );
+        let (output, overrun) = self.rng.tape.borrow_mut().finish_replay();
+        if overrun {
+            return TapeAttemptResult::Rejected;
+        }
         match result {
-            Err(TestCaseError::Fail(why)) => {
+            Err(TestCaseError::Fail(why))
+                if Ordering::Less == output.cmp_key(&best.tape) =>
+            {
                 best.tape = output;
                 best.tree = tree;
                 best.why = why;
                 TapeAttemptResult::Accepted
             }
-            // Passes and rejections both mean the edit lost the failure.
-            Ok(_) | Err(TestCaseError::Reject(..)) => {
-                TapeAttemptResult::Rejected
+            // Passes, rejections, and shortlex-worse re-recordings all
+            // mean the edit is not an improvement.
+            _ => TapeAttemptResult::Rejected,
+        }
+    }
+
+    /// Try deleting whole sub-streams: a deleted stream's draws resample
+    /// fresh on replay (an absent stream is not an overrun), which in
+    /// practice pushes generated functions toward constant observed
+    /// behaviour. Returns `(improved_anything, budget_exhausted)`.
+    fn tape_delete_streams<S: Strategy>(
+        &mut self,
+        strategy: &S,
+        test: &impl Fn(S::Value) -> TestCaseResult,
+        rng_snapshot: &TestRng,
+        best: &mut TapeBest<S::Tree>,
+        budget: &mut TapeShrinkBudget,
+        result_cache: &mut dyn ResultCache,
+        fork_output: &mut ForkOutput,
+    ) -> (bool, bool) {
+        let mut improved = false;
+        let mut si = 0;
+        while si < best.tape.streams.len() {
+            match self.tape_attempt(
+                strategy,
+                test,
+                rng_snapshot,
+                best.tape.with_stream_deleted(si),
+                best,
+                budget,
+                result_cache,
+                fork_output,
+            ) {
+                TapeAttemptResult::Accepted => {
+                    improved = true;
+                    // The stream list shifted left (and may have been
+                    // rebuilt entirely by the accepted replay); stay at
+                    // the same index.
+                }
+                TapeAttemptResult::Rejected => si += 1,
+                TapeAttemptResult::Exhausted => return (improved, true),
             }
         }
+        (improved, false)
     }
 
     /// Try deleting recorded spans (one logical unit each, e.g. one
@@ -2275,6 +2403,7 @@ impl TestRunner {
     fn tape_minimize_choice<S: Strategy>(
         &mut self,
         idx: usize,
+        stream: Option<usize>,
         strategy: &S,
         test: &impl Fn(S::Value) -> TestCaseResult,
         rng_snapshot: &TestRng,
@@ -2288,16 +2417,36 @@ impl TestRunner {
         // Try one proposal; evaluates to whether it was accepted, or
         // returns from the function when the budget runs out or an
         // accepted attempt restructured the tape under our feet.
+        // An accepted attempt can restructure the tape (and its stream
+        // list) under our feet; every access re-validates the location.
+        let loc_get = |best: &TapeBest<S::Tree>| -> Option<Choice> {
+            match stream {
+                None => best.tape.choices.get(idx).cloned(),
+                Some(si) => best
+                    .tape
+                    .streams
+                    .get(si)
+                    .and_then(|(_, choices)| choices.get(idx))
+                    .cloned(),
+            }
+        };
+        let loc_with = |best: &TapeBest<S::Tree>, choice: Choice| -> Tape {
+            match stream {
+                None => best.tape.with_choice(idx, choice),
+                Some(si) => best.tape.with_stream_choice(si, idx, choice),
+            }
+        };
+
         macro_rules! attempt {
             ($choice:expr) => {{
-                if idx >= best.tape.choices.len() {
+                if loc_get(best).is_none() {
                     return (improved, false);
                 }
                 match self.tape_attempt(
                     strategy,
                     test,
                     rng_snapshot,
-                    best.tape.with_choice(idx, $choice),
+                    loc_with(best, $choice),
                     best,
                     budget,
                     result_cache,
@@ -2358,7 +2507,11 @@ impl TestRunner {
             }};
         }
 
-        match best.tape.choices[idx].clone() {
+        let initial = match loc_get(best) {
+            Some(choice) => choice,
+            None => return (improved, false),
+        };
+        match initial {
             Choice::Integer {
                 value,
                 min,
@@ -2393,9 +2546,8 @@ impl TestRunner {
                 };
                 let target = tape::float_shrink_target(min, max);
                 let read_current =
-                    |best: &TapeBest<S::Tree>| match best.tape.choices.get(idx)
-                    {
-                        Some(Choice::Float { value, .. }) => Some(*value),
+                    |best: &TapeBest<S::Tree>| match loc_get(best) {
+                        Some(Choice::Float { value, .. }) => Some(value),
                         _ => None,
                     };
 
