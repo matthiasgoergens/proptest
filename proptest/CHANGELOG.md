@@ -45,6 +45,21 @@
   were saved for; delete them or re-trigger the failures to repopulate.
   Tape entries (`ct1` lines, the new default) do not have this problem:
   they replay the recorded values themselves.
+- Bit-set strategies (`bits`, and `sample::subsequence` which is built
+  on them) record typed choices: one boolean per candidate bit, and for
+  sampled bit sets a typed count plus one typed selection per set bit.
+  Under the tape engine they now shrink bit-aware (clear bits, lower
+  the count, move set bits toward the start of the range) instead of
+  falling back to raw byte bisection. Values generated for a given seed
+  change as a result.
+- `sample::Selector` is now a wrapper over `sample::Index` instead of
+  carrying its own RNG: selection is uniform, and shrinking moves the
+  selection precisely toward earlier elements under both engines
+  instead of haphazardly. Values selected for a given seed change as a
+  result. Note that `select`/`try_select` now buffer the iterator's
+  items (memory proportional to the sequence length) where the old
+  reservoir scan used constant memory; very large or streaming
+  iterators pay accordingly.
 
 ### Bug Fixes
 

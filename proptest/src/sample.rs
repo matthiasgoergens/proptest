@@ -17,9 +17,6 @@ use crate::std_facade::{Arc, Cow, Vec};
 use core::fmt;
 use core::mem;
 use core::ops::Range;
-use core::u64;
-
-use rand::RngExt;
 
 use crate::bits::{self, BitSetValueTree, SampledBitSetStrategy, VarBitSet};
 use crate::num;
@@ -288,12 +285,14 @@ impl IndexStrategy {
 /// [`Index`](struct.Index.html) in that it can operate on arbitrary
 /// `IntoIterator` values.
 ///
-/// Initially, the selection is roughly uniform, with a very slight bias
-/// towards items earlier in the iterator.
+/// The selection is uniform.
 ///
-/// Shrinking causes the selection to move toward items earlier in the
-/// iterator, ultimately settling on the very first, but this currently happens
-/// in a very haphazard way that may fail to find the earliest failing input.
+/// Shrinking moves the selection toward items earlier in the iterator,
+/// ultimately settling on the very first. Internally a `Selector` is an
+/// [`Index`](struct.Index.html) applied to the iterator's length, so it
+/// shrinks precisely under both shrink engines (one typed choice under
+/// the tape), and the same `Selector` picks the same element from the
+/// same sequence every time.
 ///
 /// ## Example
 ///
@@ -317,61 +316,36 @@ impl IndexStrategy {
 /// #
 /// # fn main() { my_test(); }
 /// ```
-#[derive(Clone, Debug)]
-pub struct Selector {
-    rng: TestRng,
-    bias_increment: u64,
+#[derive(Clone, Copy, Debug)]
+pub struct Selector(Index);
+
+mapfn! {
+    [] fn UsizeToSelector[](raw: usize) -> Selector {
+        Selector(Index(raw))
+    }
 }
 
-/// Strategy to create `Selector`s.
-///
-/// Created via `any::<Selector>()`.
-#[derive(Debug)]
-pub struct SelectorStrategy {
-    _nonexhaustive: (),
-}
-
-/// `ValueTree` corresponding to `SelectorStrategy`.
-#[derive(Debug)]
-pub struct SelectorValueTree {
-    rng: TestRng,
-    reverse_bias_increment: num::u64::BinarySearch,
+opaque_strategy_wrapper! {
+    /// Strategy to create `Selector`s.
+    ///
+    /// Created via `any::<Selector>()`.
+    #[derive(Clone, Debug)]
+    pub struct SelectorStrategy[][](
+        statics::Map<num::usize::AnyUniform, UsizeToSelector>)
+        -> SelectorValueTree;
+    /// `ValueTree` corresponding to `SelectorStrategy`.
+    #[derive(Clone, Debug)]
+    pub struct SelectorValueTree[][](
+        statics::Map<num::usize::BinarySearch, UsizeToSelector>)
+        -> Selector;
 }
 
 impl SelectorStrategy {
     pub(crate) fn new() -> Self {
-        SelectorStrategy { _nonexhaustive: () }
-    }
-}
-
-impl Strategy for SelectorStrategy {
-    type Tree = SelectorValueTree;
-    type Value = Selector;
-
-    fn new_tree(&self, runner: &mut TestRunner) -> NewTree<Self> {
-        Ok(SelectorValueTree {
-            rng: runner.new_rng(),
-            reverse_bias_increment: num::u64::BinarySearch::new(u64::MAX),
-        })
-    }
-}
-
-impl ValueTree for SelectorValueTree {
-    type Value = Selector;
-
-    fn current(&self) -> Selector {
-        Selector {
-            rng: self.rng.clone(),
-            bias_increment: u64::MAX - self.reverse_bias_increment.current(),
-        }
-    }
-
-    fn simplify(&mut self) -> bool {
-        self.reverse_bias_increment.simplify()
-    }
-
-    fn complicate(&mut self) -> bool {
-        self.reverse_bias_increment.complicate()
+        SelectorStrategy(statics::Map::new(
+            num::usize::ANY_UNIFORM,
+            UsizeToSelector,
+        ))
     }
 }
 
@@ -381,7 +355,9 @@ impl Selector {
     /// The selection is unaffected by the elements themselves, and is
     /// dependent only on the actual length of `it`.
     ///
-    /// `it` is always iterated completely.
+    /// `it` is always iterated completely and its items are buffered,
+    /// so the pick is a single stable position rather than a running
+    /// tournament.
     ///
     /// ## Panics
     ///
@@ -397,24 +373,17 @@ impl Selector {
     /// The selection is unaffected by the elements themselves, and is
     /// dependent only on the actual length of `it`.
     ///
-    /// `it` is always iterated completely.
+    /// `it` is always iterated completely and its items are buffered,
+    /// so the pick is a single stable position rather than a running
+    /// tournament.
     pub fn try_select<T: IntoIterator>(&self, it: T) -> Option<T::Item> {
-        let mut bias = 0u64;
-        let mut min_score = 0;
-        let mut best = None;
-        let mut rng = self.rng.clone();
-
-        for item in it {
-            let score = bias.saturating_add(rng.random());
-            if best.is_none() || score < min_score {
-                best = Some(item);
-                min_score = score;
-            }
-
-            bias = bias.saturating_add(self.bias_increment);
+        let mut items: Vec<T::Item> = it.into_iter().collect();
+        if items.is_empty() {
+            None
+        } else {
+            let ix = self.0.index(items.len());
+            Some(items.swap_remove(ix))
         }
-
-        best
     }
 }
 
@@ -424,6 +393,32 @@ mod test {
 
     use super::*;
     use crate::arbitrary::any;
+
+    #[test]
+    fn tape_engine_shrinks_subsequence_to_earliest_elements() {
+        // Subsequence rides on SampledBitSetStrategy; with typed
+        // choices, the minimal counterexample keeps the size-range
+        // minimum and the earliest elements.
+        let mut runner = crate::test_runner::TestRunner::new_with_rng(
+            crate::test_runner::Config {
+                shrink_engine: crate::test_runner::ShrinkEngine::Tape,
+                failure_persistence: None,
+                ..crate::test_runner::Config::default()
+            },
+            crate::test_runner::TestRng::deterministic_rng(
+                crate::test_runner::RngAlgorithm::default(),
+            ),
+        );
+        let strategy = subsequence(vec![10, 20, 30, 40, 50], 2..=4);
+        match runner.run(&strategy, |_| {
+            Err(crate::test_runner::TestCaseError::fail("always"))
+        }) {
+            Err(crate::test_runner::TestError::Fail(_, value)) => {
+                assert_eq!(vec![10, 20], value)
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 
     #[test]
     fn sample_slice() {
